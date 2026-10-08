@@ -54,6 +54,21 @@ pub(crate) fn define() -> TargetIsa {
         "",
         false,
     );
+    settings.add_enum(
+        "aarch64_mitigation",
+        "Experimental Spectre mitigation instrumentation inserted by this backend.",
+        r#"
+            - `none`: do not insert this experiment's barriers. Upstream Spectre
+              mitigations stay as configured.
+            - `cas_csdb`: emit one CSDB immediately after every native CAS.
+              Requires `has_lse`. LL/SC compare-exchange is rejected.
+            - `ssbb`: insert `DSB #0` (SSBB) before loads, atomics, and calls
+              that may follow an unisolated store, using a predecessor-OR
+              fixed point over the emitted instruction stream. Requires
+              `has_lse`. LL/SC atomics are rejected.
+        "#,
+        vec!["none", "cas_csdb", "ssbb"],
+    );
 
     TargetIsa::new("arm64", settings.build())
 }

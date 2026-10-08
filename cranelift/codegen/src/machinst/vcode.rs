@@ -17,19 +17,24 @@
 //! See the main module comment in `mod.rs` for more details on the VCode-based
 //! backend pipeline.
 
+use super::ssbb::{SsbbPlan, SsbbSeq};
 use crate::CodegenError;
+use crate::CodegenResult;
 use crate::FxHashMap;
 use crate::ir::pcc::*;
 use crate::ir::{self, Constant, ConstantData, ValueLabel, types};
 use crate::ranges::Ranges;
+use crate::settings;
 use crate::timing;
 use crate::trace;
 use crate::{LabelValueLoc, ValueLocRange};
 use crate::{machinst::*, trace_log_enabled};
+use alloc::string::String;
 use regalloc2::{
     Edit, Function as RegallocFunction, InstOrEdit, InstPosition, InstRange, Operand,
     OperandConstraint, OperandKind, PRegSet, ProgPoint, RegClass,
 };
+use smallvec::SmallVec;
 
 use crate::HashMap;
 use crate::hash_map::Entry;
@@ -745,6 +750,176 @@ impl<I: VCodeInst> VCode<I> {
         (clobbered_regs, function_calls)
     }
 
+    fn rewrite_allocs(inst: &mut I, iix: InsnIndex, regalloc: &regalloc2::Output) {
+        let mut allocs = regalloc.inst_allocs(iix).iter();
+        inst.get_operands(&mut |reg: &mut Reg, constraint, _kind, _pos| {
+            let alloc = allocs.next().expect("enough allocations for all operands");
+            if let Some(alloc) = alloc.as_reg() {
+                let alloc: Reg = alloc.into();
+                if let OperandConstraint::FixedReg(rreg) = constraint {
+                    debug_assert_eq!(Reg::from(rreg), alloc);
+                }
+                *reg = alloc;
+            } else if let Some(alloc) = alloc.as_stack() {
+                let alloc: Reg = alloc.into();
+                *reg = alloc;
+            }
+        });
+        debug_assert!(allocs.next().is_none());
+    }
+
+    /// Predecessor-OR fixed point over the instructions `emit` will actually produce,
+    /// including the prologue, epilogue, and regalloc spills/reloads.
+    fn compute_ssbb_plan(
+        &mut self,
+        regalloc: &regalloc2::Output,
+        flags: &settings::Flags,
+    ) -> CodegenResult<SsbbPlan> {
+        let n = self.num_blocks();
+        let frame = self.abi.frame_layout().clone();
+        let classify = |inst: &I| I::ssbb_seq(inst, &frame, flags);
+
+        let mut prologue_steps = SmallVec::<[_; 16]>::new();
+        for inst in self.abi.gen_prologue() {
+            let seq = classify(&inst)?;
+            if seq.needs_internal() {
+                return Err(CodegenError::Unsupported(format!(
+                    "aarch64_mitigation=ssbb: prologue instruction has an internal store-to-load: {inst:?}"
+                )));
+            }
+            prologue_steps.extend(seq.steps);
+        }
+        let prologue_out = SsbbSeq::transfer(true, &prologue_steps);
+
+        let is_forward_edge_cfi_enabled = self.abi.is_forward_edge_cfi_enabled();
+        let mut effects = Vec::with_capacity(n);
+        for block_idx in 0..n {
+            let block = BlockIndex::new(block_idx);
+            let mut steps = Vec::new();
+            let mut exn_cut = None;
+            if let Some(block_start) = I::gen_block_start(
+                self.block_order.is_indirect_branch_target(block),
+                is_forward_edge_cfi_enabled,
+            ) {
+                let seq = classify(&block_start)?;
+                steps.extend(seq.steps);
+            }
+            for inst_or_edit in regalloc.block_insts_and_edits(self, block) {
+                match inst_or_edit {
+                    InstOrEdit::Inst(iix) => {
+                        if self.insts[iix.index()].is_term() == MachTerminator::Ret {
+                            for inst in self.abi.gen_epilogue() {
+                                let seq = classify(&inst)?;
+                                if seq.needs_internal() {
+                                    return Err(CodegenError::Unsupported(format!(
+                                        "aarch64_mitigation=ssbb: epilogue instruction has an internal store-to-load: {inst:?}"
+                                    )));
+                                }
+                                steps.extend(seq.steps);
+                            }
+                        } else {
+                            // Classify a rewritten clone. The vcode instruction stays virtual so
+                            // emission can apply regalloc allocations exactly once.
+                            let mut inst = self.insts[iix.index()].clone();
+                            Self::rewrite_allocs(&mut inst, iix, regalloc);
+                            let seq = classify(&inst)?;
+                            if let Some(cut) = seq.exn_cut {
+                                if exn_cut.is_some() {
+                                    return Err(CodegenError::Unsupported(String::from(
+                                        "aarch64_mitigation=ssbb: more than one try-call in a block",
+                                    )));
+                                }
+                                exn_cut = Some(steps.len() + usize::from(cut));
+                            }
+                            steps.extend(seq.steps);
+                        }
+                    }
+                    InstOrEdit::Edit(Edit::Move { from, to }) => {
+                        let inst = match (from.as_reg(), to.as_reg()) {
+                            (Some(from), Some(to)) => {
+                                let from_rreg = Reg::from(from);
+                                let to_rreg = Writable::from_reg(Reg::from(to));
+                                let ty = I::canonical_type_for_rc(from.class());
+                                I::gen_move(to_rreg, from_rreg, ty)
+                            }
+                            (Some(from), None) => {
+                                let to = to.as_stack().unwrap();
+                                self.abi.gen_spill(to, RealReg::from(from))
+                            }
+                            (None, Some(to)) => {
+                                let from = from.as_stack().unwrap();
+                                let to_rreg = Writable::from_reg(RealReg::from(to));
+                                self.abi.gen_reload(to_rreg, from)
+                            }
+                            (None, None) => {
+                                panic!("regalloc2 should have eliminated stack-to-stack moves!");
+                            }
+                        };
+                        let seq = classify(&inst)?;
+                        if seq.needs_internal() {
+                            return Err(CodegenError::Unsupported(format!(
+                                "aarch64_mitigation=ssbb: spill/reload has an internal store-to-load: {inst:?}"
+                            )));
+                        }
+                        steps.extend(seq.steps);
+                    }
+                }
+            }
+            effects.push((steps, exn_cut));
+        }
+
+        let succs: Vec<Vec<BlockIndex>> = (0..n)
+            .map(|i| self.block_succs(BlockIndex::new(i)).to_vec())
+            .collect();
+        let entry = self.entry.index();
+        let mut inn = vec![false; n];
+        if prologue_out {
+            inn[entry] = true;
+        }
+        let mut queued = vec![true; n];
+        let mut work: Vec<usize> = (0..n).collect();
+        while let Some(block) = work.pop() {
+            queued[block] = false;
+            let (steps, exn_cut) = &effects[block];
+            let normal = SsbbSeq::transfer(inn[block], steps);
+            let exn = exn_cut.map(|cut| SsbbSeq::transfer(inn[block], &steps[..=cut]));
+            let block_succs = &succs[block];
+            for (succ_idx, succ) in block_succs.iter().enumerate() {
+                let edge = if let Some(exn_dirty) = exn {
+                    if succ_idx + 1 == block_succs.len() {
+                        normal
+                    } else {
+                        exn_dirty
+                    }
+                } else {
+                    normal
+                };
+                let succ = succ.index();
+                if edge && !inn[succ] {
+                    inn[succ] = true;
+                    if !queued[succ] {
+                        work.push(succ);
+                        queued[succ] = true;
+                    }
+                }
+            }
+        }
+
+        let mut extra_bytes = vec![0u32; n];
+        for block in 0..n {
+            let mut barriers = SsbbSeq::count_barriers(inn[block], &effects[block].0);
+            if block == entry {
+                barriers += SsbbSeq::count_barriers(true, &prologue_steps);
+            }
+            extra_bytes[block] = barriers * 4;
+        }
+
+        Ok(SsbbPlan {
+            block_in: inn,
+            extra_bytes,
+        })
+    }
+
     /// Emit the instructions to a `MachBuffer`, containing fixed-up
     /// code and external reloc/trap/etc. records ready for use. Takes
     /// the regalloc results as well.
@@ -758,7 +933,7 @@ impl<I: VCodeInst> VCode<I> {
         want_disasm: bool,
         flags: &settings::Flags,
         ctrl_plane: &mut ControlPlane,
-    ) -> EmitResult
+    ) -> CodegenResult<EmitResult>
     where
         I: VCodeInst,
     {
@@ -809,6 +984,15 @@ impl<I: VCodeInst> VCode<I> {
         let mut last_offset = None;
         let mut inst_offsets = vec![];
         let mut state = I::State::new(&self.abi, core::mem::take(ctrl_plane));
+        let ssbb_on = I::ssbb_enabled(&self.emit_info);
+        let ssbb_plan = if ssbb_on {
+            let plan = self.compute_ssbb_plan(regalloc, flags)?;
+            buffer.set_veneer_load_barrier(Some(I::ssbb_barrier_word()));
+            state.ssbb_install(&plan.block_in);
+            Some(plan)
+        } else {
+            None
+        };
 
         let mut disasm = String::new();
 
@@ -858,6 +1042,25 @@ impl<I: VCodeInst> VCode<I> {
                            disasm: &mut String,
                            buffer: &mut MachBuffer<I>,
                            state: &mut I::State| {
+                if ssbb_on {
+                    let seq = inst
+                        .ssbb_seq(state.frame_layout(), flags)
+                        .expect("ssbb classification changed between the fixed-point and emission");
+                    if !seq.needs_internal() {
+                        let dirty = state.ssbb_dirty();
+                        if seq
+                            .steps
+                            .first()
+                            .is_some_and(|step| SsbbSeq::needs_guard(dirty, *step))
+                        {
+                            if want_disasm {
+                                writeln!(disasm, "  {}", I::ssbb_mnemonic()).unwrap();
+                            }
+                            state.ssbb_emit_barrier(buffer, &self.emit_info);
+                        }
+                        state.ssbb_set_dirty(SsbbSeq::transfer(dirty, &seq.steps));
+                    }
+                }
                 if want_disasm && !inst.is_args() {
                     let mut s = state.clone();
                     writeln!(disasm, "  {}", inst.pretty_print_inst(&mut s)).unwrap();
@@ -865,14 +1068,26 @@ impl<I: VCodeInst> VCode<I> {
                 inst.emit(buffer, &self.emit_info, state);
             };
 
+            if ssbb_on {
+                state.ssbb_reset_barrier_count();
+            }
+
             // Is this the first block? Emit the prologue directly if so.
+            // The prologue runs once, before the entry label, starting from external dirty=true.
             if block == self.entry {
                 trace!(" -> entry block");
+                if ssbb_on {
+                    state.ssbb_set_dirty(true);
+                }
                 buffer.start_srcloc(Default::default());
                 for inst in &self.abi.gen_prologue() {
                     do_emit(&inst, &mut disasm, &mut buffer, &mut state);
                 }
                 buffer.end_srcloc();
+            }
+
+            if ssbb_on {
+                state.ssbb_set_dirty(ssbb_plan.as_ref().unwrap().block_in[block.index()]);
             }
 
             // Now emit the regular block body.
@@ -1099,15 +1314,30 @@ impl<I: VCodeInst> VCode<I> {
                 cur_srcloc = None;
             }
 
+            if let Some(plan) = ssbb_plan.as_ref() {
+                debug_assert_eq!(
+                    state.ssbb_barrier_count() * 4,
+                    plan.extra_bytes[block.index()],
+                    "ssbb insertion drifted from the fixed-point plan in block {}",
+                    block.index()
+                );
+            }
+
             // Do we need an island? Get the worst-case size of the next BB, add
             // it to the optional padding behind the block, and pass this to the
             // `MachBuffer` to determine if an island is necessary.
+            // Inserted SSBBs are not inside `worst_case_size`, so add their exact
+            // byte count from the same plan emission will follow.
             let worst_case_next_bb = if block_order_idx < final_order.len() - 1 {
                 let next_block = final_order[block_order_idx + 1];
                 let next_block_range = self.block_ranges.get(next_block.index());
                 let next_block_size = next_block_range.len() as u32;
                 let next_block_ra_insertions = ra_edits_per_block[next_block.index()];
-                I::worst_case_size() * (next_block_size + next_block_ra_insertions)
+                let ssbb_extra = ssbb_plan
+                    .as_ref()
+                    .map(|plan| plan.extra_bytes[next_block.index()])
+                    .unwrap_or(0);
+                I::worst_case_size() * (next_block_size + next_block_ra_insertions) + ssbb_extra
             } else {
                 0
             };
@@ -1181,13 +1411,13 @@ impl<I: VCodeInst> VCode<I> {
         // Store metadata about frame layout in the MachBuffer.
         buffer.set_frame_layout(self.abi.frame_slot_metadata());
 
-        EmitResult {
+        Ok(EmitResult {
             buffer: buffer.finish(&self.constants, ctrl_plane),
             bb_offsets,
             bb_edges,
             disasm: if want_disasm { Some(disasm) } else { None },
             value_labels_ranges,
-        }
+        })
     }
 
     fn monotonize_inst_offsets(&self, inst_offsets: &mut [CodeOffset], func_body_len: u32) {

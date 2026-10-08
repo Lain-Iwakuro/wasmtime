@@ -553,6 +553,12 @@ information about this check\
                 };
             }
 
+            // Experiment switch. It does not require a host CPU feature check;
+            // cas_csdb still requires the separate has_lse flag at compile time.
+            FlagValue::Enum("none" | "cas_csdb" | "ssbb") if flag == "aarch64_mitigation" => {
+                return Ok(());
+            }
+
             // Only `bool` values are supported right now, other settings would
             // need more support here.
             _ => {

@@ -332,6 +332,8 @@ pub struct MachBuffer<I: VCodeInst> {
     /// containing a function body, this allows interpretation of
     /// runtime state given a view of an active stack frame.
     frame_layout: Option<MachBufferFrameLayout>,
+    /// When set, veneers that load a literal are prefixed with this barrier word.
+    veneer_load_barrier: Option<u32>,
 }
 
 impl MachBufferFinalized<Stencil> {
@@ -502,7 +504,30 @@ impl<I: VCodeInst> MachBuffer<I> {
             used_constants: Default::default(),
             open_patchable: false,
             frame_layout: None,
+            veneer_load_barrier: None,
         }
+    }
+
+    /// Prefix load-bearing veneers with a 4-byte barrier (AArch64 SSBB / `DSB #0`).
+    pub fn set_veneer_load_barrier(&mut self, word: Option<u32>) {
+        self.veneer_load_barrier = word;
+    }
+
+    /// Emit one veneer without going through island deadlines. Tests use this to
+    /// check the SSBB prefix against the fixed PC-relative veneer body.
+    #[cfg(test)]
+    pub(crate) fn testing_emit_veneer(
+        &mut self,
+        label: MachLabel,
+        offset: CodeOffset,
+        kind: I::LabelUse,
+    ) {
+        self.emit_veneer(label, offset, kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Current offset from start of buffer.
@@ -1293,9 +1318,14 @@ impl<I: VCodeInst> MachBuffer<I> {
         // the worst-case size for each platform. This is an over-generalization
         // to avoid iterating over the `fixup_records` list or maintaining
         // information about it as we go along.
+        let veneer_barrier = if self.veneer_load_barrier.is_some() {
+            4
+        } else {
+            0
+        };
         let island_worst_case_size = ((self.fixup_records.len() + self.pending_fixup_records.len())
             as u32)
-            * (I::LabelUse::worst_case_veneer_size())
+            * (I::LabelUse::worst_case_veneer_size() + veneer_barrier)
             + self.pending_constants_size
             + (self.pending_traps.len() * I::TRAP_OPCODE.len()) as u32;
         self.cur_offset()
@@ -1497,10 +1527,24 @@ impl<I: VCodeInst> MachBuffer<I> {
             offset, veneer_offset
         );
         kind.patch(slice, offset, veneer_offset);
-        // Generate the veneer.
-        let veneer_slice = self.get_appended_space(kind.veneer_size() as usize);
-        let (veneer_fixup_off, veneer_label_use) =
-            kind.generate_veneer(veneer_slice, veneer_offset);
+        // Generate the veneer. A load inside the veneer (AArch64's 26-bit branch
+        // expansion) is prefixed with SSBB when that mitigation is selected.
+        // The prefix sits before `generate_veneer`'s fixed PC-relative offsets,
+        // and those offsets are computed from the first byte of the veneer body.
+        let barrier = self.veneer_load_barrier;
+        let extra = if barrier.is_some() && kind.veneer_has_load() {
+            4
+        } else {
+            0
+        };
+        let veneer_slice = self.get_appended_space((kind.veneer_size() + extra) as usize);
+        let (body, body_offset) = if extra == 4 {
+            veneer_slice[..4].copy_from_slice(&barrier.unwrap().to_le_bytes());
+            (&mut veneer_slice[4..], veneer_offset + 4)
+        } else {
+            (veneer_slice, veneer_offset)
+        };
+        let (veneer_fixup_off, veneer_label_use) = kind.generate_veneer(body, body_offset);
         trace!(
             "generated veneer; fixup offset {}, label_use {:?}",
             veneer_fixup_off, veneer_label_use

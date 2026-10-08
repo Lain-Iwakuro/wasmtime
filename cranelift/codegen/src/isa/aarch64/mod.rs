@@ -56,7 +56,24 @@ impl AArch64Backend {
         domtree: &DominatorTree,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
-        let emit_info = EmitInfo::new(self.flags.clone());
+        match self.isa_flags.aarch64_mitigation() {
+            aarch64_settings::Aarch64Mitigation::None => {}
+            aarch64_settings::Aarch64Mitigation::CasCsdb => {
+                if !self.isa_flags.has_lse() {
+                    return Err(crate::CodegenError::Unsupported(String::from(
+                        "aarch64_mitigation=cas_csdb requires has_lse; LL/SC CAS is not covered",
+                    )));
+                }
+            }
+            aarch64_settings::Aarch64Mitigation::Ssbb => {
+                if !self.isa_flags.has_lse() {
+                    return Err(crate::CodegenError::Unsupported(String::from(
+                        "aarch64_mitigation=ssbb requires has_lse; LL/SC atomics are not covered",
+                    )));
+                }
+            }
+        }
+        let emit_info = EmitInfo::with_isa_flags(self.flags.clone(), self.isa_flags.clone());
         let sigs = SigSet::new::<abi::AArch64MachineDeps>(func, &self.flags)?;
         let abi = abi::AArch64Callee::new(func, self, &self.isa_flags, &sigs)?;
         compile::compile::<AArch64Backend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
@@ -73,7 +90,7 @@ impl TargetIsa for AArch64Backend {
     ) -> CodegenResult<CompiledCodeStencil> {
         let (vcode, regalloc_result) = self.compile_vcode(func, domtree, ctrl_plane)?;
 
-        let emit_result = vcode.emit(&regalloc_result, want_disasm, &self.flags, ctrl_plane);
+        let emit_result = vcode.emit(&regalloc_result, want_disasm, &self.flags, ctrl_plane)?;
         let value_labels_ranges = emit_result.value_labels_ranges;
         let buffer = emit_result.buffer;
 

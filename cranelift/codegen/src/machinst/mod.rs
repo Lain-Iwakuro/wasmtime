@@ -69,6 +69,7 @@ pub mod isle;
 
 pub mod lower;
 pub use lower::*;
+pub mod ssbb;
 pub mod vcode;
 pub use vcode::*;
 pub mod compile;
@@ -270,6 +271,11 @@ pub trait MachInstLabelUse: Clone + Copy + Debug + Eq {
     /// stage, a jump that supports a full 32-bit range, for example.
     fn generate_veneer(self, buffer: &mut [u8], veneer_offset: CodeOffset) -> (CodeOffset, Self);
 
+    /// The veneer contains a load, so an SSBB may be prepended when that mode is on.
+    fn veneer_has_load(self) -> bool {
+        false
+    }
+
     /// Returns the corresponding label-use for the relocation specified.
     ///
     /// This returns `None` if the relocation doesn't have a corresponding
@@ -356,6 +362,30 @@ pub trait MachInstEmit: MachInst {
 
     /// Pretty-print the instruction.
     fn pretty_print_inst(&self, state: &mut Self::State) -> String;
+
+    /// `aarch64_mitigation=ssbb` is selected. Other targets leave this false.
+    fn ssbb_enabled(_info: &Self::Info) -> bool {
+        false
+    }
+
+    /// Memory effects of this instruction in emission order.
+    fn ssbb_seq(
+        &self,
+        _frame: &FrameLayout,
+        _flags: &settings::Flags,
+    ) -> CodegenResult<ssbb::SsbbSeq> {
+        Ok(ssbb::SsbbSeq::neutral())
+    }
+
+    /// Encoding of `DSB #0` / SSBB. Zero when the target has no such barrier.
+    fn ssbb_barrier_word() -> u32 {
+        0
+    }
+
+    /// Disassembly text for an inserted SSBB.
+    fn ssbb_mnemonic() -> &'static str {
+        "dsb #0"
+    }
 }
 
 /// A trait describing the emission state carried between MachInsts when
@@ -384,6 +414,33 @@ pub trait MachInstEmitState<I: VCodeInst>: Default + Clone + Debug {
 
     /// The [`FrameLayout`] for the function currently being compiled.
     fn frame_layout(&self) -> &FrameLayout;
+
+    /// Install per-block SSBB entry state. Default is a no-op.
+    fn ssbb_install(&mut self, _block_in: &[bool]) {}
+
+    /// SSBB mode is active for this emission.
+    fn ssbb_active(&self) -> bool {
+        false
+    }
+
+    /// Set the running SSBB dirty bit. No-op when SSBB mode is off.
+    fn ssbb_set_dirty(&mut self, _dirty: bool) {}
+
+    /// Current SSBB dirty bit. False when SSBB mode is off.
+    fn ssbb_dirty(&self) -> bool {
+        false
+    }
+
+    /// Emit one SSBB and count it against this block's planned size.
+    fn ssbb_emit_barrier(&mut self, _sink: &mut MachBuffer<I>, _info: &I::Info) {}
+
+    /// Start a new block's inserted-barrier count.
+    fn ssbb_reset_barrier_count(&mut self) {}
+
+    /// How many SSBBs have been inserted in the current block.
+    fn ssbb_barrier_count(&self) -> u32 {
+        0
+    }
 }
 
 /// The result of a `MachBackend::compile_function()` call. Contains machine

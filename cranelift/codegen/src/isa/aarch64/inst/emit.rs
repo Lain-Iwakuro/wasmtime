@@ -4,6 +4,7 @@ use cranelift_control::ControlPlane;
 
 use crate::ir::{self, types::*};
 use crate::isa::aarch64::inst::*;
+use crate::settings;
 use crate::trace;
 
 /// Memory addressing mode finalization: convert "special" modes (e.g.,
@@ -660,6 +661,14 @@ fn enc_asimd_mod_imm(rd: Writable<Reg>, q_op: u32, cmode: u32, imm: u8) -> u32 {
         | machreg_to_vec(rd.to_reg())
 }
 
+/// Compiler-only SSBB cursor. It is not a runtime flag.
+#[derive(Clone, Debug)]
+struct SsbbCursor {
+    dirty: bool,
+    block_in: alloc::vec::Vec<bool>,
+    barriers: u32,
+}
+
 /// State carried between emissions of a sequence of instructions.
 #[derive(Default, Clone, Debug)]
 pub struct EmitState {
@@ -672,6 +681,8 @@ pub struct EmitState {
     ctrl_plane: ControlPlane,
 
     frame_layout: FrameLayout,
+
+    ssbb: Option<SsbbCursor>,
 }
 
 impl MachInstEmitState<Inst> for EmitState {
@@ -680,6 +691,7 @@ impl MachInstEmitState<Inst> for EmitState {
             user_stack_map: None,
             ctrl_plane,
             frame_layout: abi.frame_layout().clone(),
+            ssbb: None,
         }
     }
 
@@ -698,6 +710,42 @@ impl MachInstEmitState<Inst> for EmitState {
     fn frame_layout(&self) -> &FrameLayout {
         &self.frame_layout
     }
+
+    fn ssbb_install(&mut self, block_in: &[bool]) {
+        self.ssbb = Some(SsbbCursor {
+            dirty: false,
+            block_in: block_in.to_vec(),
+            barriers: 0,
+        });
+    }
+
+    fn ssbb_active(&self) -> bool {
+        self.ssbb.is_some()
+    }
+
+    fn ssbb_set_dirty(&mut self, dirty: bool) {
+        if let Some(ssbb) = self.ssbb.as_mut() {
+            ssbb.dirty = dirty;
+        }
+    }
+
+    fn ssbb_dirty(&self) -> bool {
+        self.ssbb.as_ref().map(|ssbb| ssbb.dirty).unwrap_or(false)
+    }
+
+    fn ssbb_emit_barrier(&mut self, sink: &mut MachBuffer<Inst>, _info: &EmitInfo) {
+        self.emit_ssbb(sink);
+    }
+
+    fn ssbb_reset_barrier_count(&mut self) {
+        if let Some(ssbb) = self.ssbb.as_mut() {
+            ssbb.barriers = 0;
+        }
+    }
+
+    fn ssbb_barrier_count(&self) -> u32 {
+        self.ssbb.as_ref().map(|ssbb| ssbb.barriers).unwrap_or(0)
+    }
 }
 
 impl EmitState {
@@ -708,15 +756,70 @@ impl EmitState {
     fn clear_post_insn(&mut self) {
         self.user_stack_map = None;
     }
+
+    fn emit_ssbb(&mut self, sink: &mut MachBuffer<Inst>) {
+        let Some(ssbb) = self.ssbb.as_mut() else {
+            return;
+        };
+        sink.put4(super::ssbb::SSBB_ENCODING);
+        ssbb.barriers += 1;
+    }
+
+    /// Apply one memory step for an instruction that inserts its own barriers.
+    pub(crate) fn ssbb_step(
+        &mut self,
+        step: crate::machinst::ssbb::SsbbMemStep,
+        sink: &mut MachBuffer<Inst>,
+    ) {
+        let Some(ssbb) = self.ssbb.as_mut() else {
+            return;
+        };
+        if crate::machinst::ssbb::SsbbSeq::needs_guard(ssbb.dirty, step) {
+            sink.put4(super::ssbb::SSBB_ENCODING);
+            ssbb.barriers += 1;
+        }
+        ssbb.dirty = match step {
+            crate::machinst::ssbb::SsbbMemStep::Load
+            | crate::machinst::ssbb::SsbbMemStep::Clear => false,
+            crate::machinst::ssbb::SsbbMemStep::Store
+            | crate::machinst::ssbb::SsbbMemStep::Atomic
+            | crate::machinst::ssbb::SsbbMemStep::Call => true,
+        };
+    }
 }
 
 /// Constant state used during function compilation.
-pub struct EmitInfo(settings::Flags);
+pub struct EmitInfo {
+    flags: settings::Flags,
+    isa_flags: crate::isa::aarch64::settings::Flags,
+}
 
 impl EmitInfo {
-    /// Create a constant state for emission of instructions.
+    /// Create emission state with default AArch64 ISA flags (`aarch64_mitigation=none`).
     pub fn new(flags: settings::Flags) -> Self {
-        Self(flags)
+        let isa_flags = crate::isa::aarch64::settings::Flags::new(
+            &flags,
+            &crate::isa::aarch64::settings::builder(),
+        );
+        Self::with_isa_flags(flags, isa_flags)
+    }
+
+    /// Create emission state using the ISA flags selected for this compilation.
+    pub fn with_isa_flags(
+        flags: settings::Flags,
+        isa_flags: crate::isa::aarch64::settings::Flags,
+    ) -> Self {
+        Self { flags, isa_flags }
+    }
+
+    fn cas_csdb(&self) -> bool {
+        self.isa_flags.aarch64_mitigation()
+            == crate::isa::aarch64::settings::Aarch64Mitigation::CasCsdb
+    }
+
+    fn ssbb(&self) -> bool {
+        self.isa_flags.aarch64_mitigation()
+            == crate::isa::aarch64::settings::Aarch64Mitigation::Ssbb
     }
 }
 
@@ -1655,8 +1758,18 @@ impl MachInstEmit for Inst {
                 }
 
                 sink.put4(enc_cas(size, rd, rt, rn));
+                // cas-csdb: the barrier must sit between the native CAS and any
+                // later use of its result or a subsequent memory operation.
+                if emit_info.cas_csdb() {
+                    Inst::Csdb.emit(sink, emit_info, state);
+                }
             }
             &Inst::AtomicCASLoop { ty, flags, .. } => {
+                if emit_info.cas_csdb() {
+                    panic!(
+                        "aarch64_mitigation=cas_csdb does not cover LL/SC AtomicCASLoop; native CAS requires has_lse"
+                    );
+                }
                 /* Emit this:
                     again:
                      ldaxr{,b,h} x/w27, [x25]
@@ -1758,6 +1871,9 @@ impl MachInstEmit for Inst {
             }
             &Inst::Csdb {} => {
                 sink.put4(0xd503229f);
+            }
+            &Inst::Ssbb {} => {
+                sink.put4(super::ssbb::SSBB_ENCODING);
             }
             &Inst::FpuMove32 { rd, rn } => {
                 sink.put4(enc_fpurr(0b000_11110_00_1_000000_10000, rd, rn));
@@ -2944,6 +3060,10 @@ impl MachInstEmit for Inst {
             &Inst::Call { ref info } => {
                 let start = sink.cur_offset();
                 let user_stack_map = state.take_stack_map();
+                let internal = call_retval_needs_internal_ssbb(info, state);
+                if internal {
+                    state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Call, sink);
+                }
                 sink.add_reloc(Reloc::Arm64Call, &info.dest, 0);
                 sink.put4(enc_jump26(0b100101, 0));
                 if let Some(s) = user_stack_map {
@@ -2971,12 +3091,7 @@ impl MachInstEmit for Inst {
                 if info.patchable {
                     sink.add_patchable_call_site(sink.cur_offset() - start);
                 } else {
-                    // Load any stack-carried return values.
-                    info.emit_retval_loads::<AArch64MachineDeps, _, _>(
-                        state.frame_layout().stackslots_size,
-                        |inst| inst.emit(sink, emit_info, state),
-                        |needed_space| Some(Inst::EmitIsland { needed_space }),
-                    );
+                    emit_call_retvals(info, sink, emit_info, state, internal);
                 }
 
                 // If this is a try-call, jump to the continuation
@@ -2994,6 +3109,10 @@ impl MachInstEmit for Inst {
             }
             &Inst::CallInd { ref info } => {
                 let user_stack_map = state.take_stack_map();
+                let internal = call_retval_needs_internal_ssbb(info, state);
+                if internal {
+                    state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Call, sink);
+                }
                 sink.put4(
                     0b1101011_0001_11111_000000_00000_00000 | (machreg_to_gpr(info.dest) << 5),
                 );
@@ -3019,12 +3138,7 @@ impl MachInstEmit for Inst {
                     }
                 }
 
-                // Load any stack-carried return values.
-                info.emit_retval_loads::<AArch64MachineDeps, _, _>(
-                    state.frame_layout().stackslots_size,
-                    |inst| inst.emit(sink, emit_info, state),
-                    |needed_space| Some(Inst::EmitIsland { needed_space }),
-                );
+                emit_call_retvals(info, sink, emit_info, state, internal);
 
                 // If this is a try-call, jump to the continuation
                 // (normal-return) block.
@@ -3557,7 +3671,7 @@ impl MachInstEmit for Inst {
             }
 
             &Inst::StackProbeLoop { start, end, step } => {
-                assert!(emit_info.0.enable_probestack());
+                assert!(emit_info.flags.enable_probestack());
 
                 // The loop generated here uses `start` as a counter register to
                 // count backwards until negating it exceeds `end`. In other
@@ -3636,6 +3750,95 @@ impl MachInstEmit for Inst {
     fn pretty_print_inst(&self, state: &mut Self::State) -> String {
         self.print_with_state(state)
     }
+
+    fn ssbb_enabled(info: &EmitInfo) -> bool {
+        info.ssbb()
+    }
+
+    fn ssbb_seq(
+        &self,
+        frame: &FrameLayout,
+        flags: &settings::Flags,
+    ) -> crate::CodegenResult<crate::machinst::ssbb::SsbbSeq> {
+        super::ssbb::classify(self, frame, flags)
+    }
+
+    fn ssbb_barrier_word() -> u32 {
+        super::ssbb::SSBB_ENCODING
+    }
+
+    fn ssbb_mnemonic() -> &'static str {
+        "dsb #0"
+    }
+}
+
+fn call_retval_needs_internal_ssbb<T>(
+    info: &crate::machinst::abi::CallInfo<T>,
+    state: &EmitState,
+) -> bool {
+    if !state.ssbb_active() {
+        return false;
+    }
+    super::ssbb::call_retval_ops(info, state.frame_layout().stackslots_size)
+        .iter()
+        .any(|op| matches!(op, super::ssbb::RetvalOp::Mem { .. }))
+}
+
+fn emit_call_retvals<T>(
+    info: &crate::machinst::abi::CallInfo<T>,
+    sink: &mut MachBuffer<Inst>,
+    emit_info: &EmitInfo,
+    state: &mut EmitState,
+    internal: bool,
+) {
+    if internal {
+        for op in super::ssbb::call_retval_ops(info, state.frame_layout().stackslots_size) {
+            match op {
+                super::ssbb::RetvalOp::Island { needed_space } => {
+                    Inst::EmitIsland { needed_space }.emit(sink, emit_info, state);
+                }
+                super::ssbb::RetvalOp::Mem { step, inst } => {
+                    state.ssbb_step(step, sink);
+                    inst.emit(sink, emit_info, state);
+                }
+            }
+        }
+    } else {
+        info.emit_retval_loads::<AArch64MachineDeps, _, _>(
+            state.frame_layout().stackslots_size,
+            |inst| inst.emit(sink, emit_info, state),
+            |needed_space| Some(Inst::EmitIsland { needed_space }),
+        );
+    }
+}
+
+/// Instructions emitted before the tail-call branch. Classification uses this
+/// same list, so a store/load inside the restore is not collapsed into one step.
+pub(crate) fn return_call_setup_insts<T>(
+    frame: &FrameLayout,
+    flags: &settings::Flags,
+    info: &ReturnCallInfo<T>,
+) -> SmallVec<[Inst; 16]> {
+    let mut insts = AArch64MachineDeps::gen_clobber_restore(CallConv::Tail, flags, frame);
+    if frame.setup_area_size > 0 {
+        // `ldp fp, lr, [sp], #16`. SP is already adjusted by clobber restore.
+        insts.push(Inst::LoadP64 {
+            rt: writable_fp_reg(),
+            rt2: writable_link_reg(),
+            mem: PairAMode::SPPostIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(i64::from(frame.setup_area_size), types::I64)
+                    .unwrap(),
+            },
+            flags: MemFlags::trusted(),
+        });
+    }
+    let incoming_args_diff = frame.tail_args_size - info.new_stack_arg_size;
+    if incoming_args_diff > 0 {
+        insts.extend(AArch64MachineDeps::gen_sp_reg_adjust(
+            i32::try_from(incoming_args_diff).unwrap(),
+        ));
+    }
+    insts
 }
 
 fn emit_return_call_common_sequence<T>(
@@ -3644,41 +3847,8 @@ fn emit_return_call_common_sequence<T>(
     state: &mut EmitState,
     info: &ReturnCallInfo<T>,
 ) {
-    for inst in
-        AArch64MachineDeps::gen_clobber_restore(CallConv::Tail, &emit_info.0, state.frame_layout())
-    {
+    for inst in return_call_setup_insts(state.frame_layout(), &emit_info.flags, info) {
         inst.emit(sink, emit_info, state);
-    }
-
-    let setup_area_size = state.frame_layout().setup_area_size;
-    if setup_area_size > 0 {
-        // N.B.: sp is already adjusted to the appropriate place by the
-        // clobber-restore code (which also frees the fixed frame). Hence, there
-        // is no need for the usual `mov sp, fp` here.
-
-        // `ldp fp, lr, [sp], #16`
-        Inst::LoadP64 {
-            rt: writable_fp_reg(),
-            rt2: writable_link_reg(),
-            mem: PairAMode::SPPostIndexed {
-                // TODO: we could fold the increment for incoming_args_diff here, as long as that
-                // value is less than 502*8, by adding it to `setup_area_size`.
-                // https://developer.arm.com/documentation/ddi0596/2020-12/Base-Instructions/LDP--Load-Pair-of-Registers-
-                simm7: SImm7Scaled::maybe_from_i64(i64::from(setup_area_size), types::I64).unwrap(),
-            },
-            flags: MemFlags::trusted(),
-        }
-        .emit(sink, emit_info, state);
-    }
-
-    // Adjust SP to account for the possible over-allocation in the prologue.
-    let incoming_args_diff = state.frame_layout().tail_args_size - info.new_stack_arg_size;
-    if incoming_args_diff > 0 {
-        for inst in
-            AArch64MachineDeps::gen_sp_reg_adjust(i32::try_from(incoming_args_diff).unwrap())
-        {
-            inst.emit(sink, emit_info, state);
-        }
     }
 
     if let Some(key) = info.key {

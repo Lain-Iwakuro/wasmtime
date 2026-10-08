@@ -1,6 +1,7 @@
 use crate::ir::types::*;
 use crate::ir::{ExternalName, TrapCode};
 use crate::isa::aarch64::inst::*;
+use crate::settings::Configurable;
 
 use alloc::boxed::Box;
 
@@ -63,6 +64,8 @@ fn test_aarch64_binemit() {
     insns.push((Inst::Nop0, "", "nop-zero-len"));
     insns.push((Inst::Nop4, "1F2003D5", "nop"));
     insns.push((Inst::Csdb, "9F2203D5", "csdb"));
+    // DSB #0. Apple otool prints this encoding as `ssbb`.
+    insns.push((Inst::Ssbb, "9F3003D5", "dsb #0"));
     insns.push((
         Inst::Udf {
             trap_code: TrapCode::STACK_OVERFLOW,
@@ -7942,6 +7945,42 @@ fn test_aarch64_binemit() {
         let buffer = buffer.finish(&Default::default(), &mut Default::default());
         let actual_encoding = &buffer.stringify_code_bytes();
         assert_eq!(expected_encoding, actual_encoding);
+    }
+}
+
+fn encode_inst(insn: &Inst, emit_info: &EmitInfo) -> String {
+    let mut buffer = MachBuffer::new();
+    insn.emit(&mut buffer, emit_info, &mut Default::default());
+    let buffer = buffer.finish(&Default::default(), &mut Default::default());
+    buffer.stringify_code_bytes()
+}
+
+#[test]
+fn test_cas_csdb_follows_native_cas() {
+    let shared = settings::Flags::new(settings::builder());
+    let none = EmitInfo::new(shared.clone());
+    let mut isa_builder = crate::isa::aarch64::settings::builder();
+    isa_builder.set("aarch64_mitigation", "cas_csdb").unwrap();
+    let isa_flags = crate::isa::aarch64::settings::Flags::new(&shared, &isa_builder);
+    let cas_csdb = EmitInfo::with_isa_flags(shared, isa_flags);
+
+    for ty in [I8, I16, I32, I64] {
+        let insn = Inst::AtomicCAS {
+            rd: writable_xreg(28),
+            rs: xreg(28),
+            rt: xreg(20),
+            rn: xreg(10),
+            ty,
+            flags: MemFlags::trusted(),
+        };
+        let baseline = encode_inst(&insn, &none);
+        let mitigated = encode_inst(&insn, &cas_csdb);
+        assert_eq!(
+            mitigated,
+            format!("{baseline}9F2203D5"),
+            "native {ty} CAS must be immediately followed by CSDB"
+        );
+        assert_eq!(baseline.len(), 8, "native CAS encoding is one instruction");
     }
 }
 

@@ -2370,6 +2370,12 @@
                   (has_type (valid_atomic_transaction ty)
                       (atomic_rmw (little_or_native_endian flags) (AtomicRmwOp.And) addr src))))
       (lse_atomic_rmw (AtomicRMWOp.Clr) addr (eon ty src (zero_reg)) ty flags))
+;; Wasm `atomic.rmw.xchg` (used by wasi-libc locks) has an LSE encoding, `swpal`.
+;; Without this rule, `has_lse` still lowers it to an LL/SC loop, which `ssbb` rejects.
+(rule 1 (lower (and (use_lse)
+                  (has_type (valid_atomic_transaction ty)
+                      (atomic_rmw (little_or_native_endian flags) (AtomicRmwOp.Xchg) addr src))))
+      (lse_atomic_rmw (AtomicRMWOp.Swp) addr src ty flags))
 
 
 (rule (lower (has_type (valid_atomic_transaction ty)

@@ -23,6 +23,7 @@ pub mod args;
 pub use self::args::*;
 pub mod emit;
 pub(crate) use self::emit::*;
+mod ssbb;
 use crate::isa::aarch64::abi::AArch64MachineDeps;
 
 pub(crate) mod unwind;
@@ -508,7 +509,7 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(rn);
             collector.reg_use(rt);
         }
-        Inst::Fence {} | Inst::Csdb {} => {}
+        Inst::Fence {} | Inst::Csdb {} | Inst::Ssbb {} => {}
         Inst::FpuMove32 { rd, rn } => {
             collector.reg_def(rd);
             collector.reg_use(rn);
@@ -1678,6 +1679,9 @@ impl Inst {
             }
             &Inst::Csdb {} => {
                 format!("csdb")
+            }
+            &Inst::Ssbb {} => {
+                format!("dsb #0")
             }
             &Inst::FpuMove32 { rd, rn } => {
                 let rd = pretty_print_vreg_scalar(rd.to_reg(), ScalarSize::Size32);
@@ -3012,6 +3016,12 @@ impl MachInstLabelUse for LabelUse {
             (insn_word & !mask) | pc_rel_inserted
         };
         buffer[0..4].clone_from_slice(&u32::to_le_bytes(insn_word));
+    }
+
+    fn veneer_has_load(self) -> bool {
+        // The 26-bit branch veneer loads a PC-relative literal. Shorter
+        // veneers are a single branch and do not touch memory.
+        matches!(self, LabelUse::Branch26)
     }
 
     /// Is a veneer supported for this label reference type?

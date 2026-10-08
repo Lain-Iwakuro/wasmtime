@@ -283,7 +283,7 @@ pub enum StackAMode {
 }
 
 impl StackAMode {
-    fn offset_by(&self, offset: u32) -> Self {
+    pub(crate) fn offset_by(&self, offset: u32) -> Self {
         match self {
             StackAMode::IncomingArg(off, size) => {
                 StackAMode::IncomingArg(off.checked_add(i64::from(offset)).unwrap(), *size)

@@ -331,6 +331,11 @@
        ;; Consumption of speculative data barrier.
        (Csdb)
 
+       ;; Speculative store bypass barrier. Architecturally `DSB #0`;
+       ;; disassemblers may print `dsb #0` or `ssbb`. This is not a `Fence`
+       ;; (`dmb ish`) and must not be substituted by one.
+       (Ssbb)
+
        ;; FPU 32-bit move.
        (FpuMove32
          (rd WritableReg)
