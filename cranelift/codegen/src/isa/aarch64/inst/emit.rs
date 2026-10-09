@@ -761,7 +761,10 @@ impl MachInstEmitState<Inst> for EmitState {
         if let Some(ssbb) = self.ssbb.as_mut() {
             ssbb.legacy_internal = active;
             if active {
-                ssbb.dirty = true;
+                // Incoming Pending is protected by the shared plan before
+                // this instruction. Only store/call-to-load transitions inside
+                // the expansion may emit fixed legacy guards here.
+                ssbb.dirty = false;
             }
         }
     }
@@ -862,9 +865,9 @@ impl MachInstEmit for Inst {
         // emitted following an `EmitIsland`.
         let mut start_off = sink.cur_offset();
 
-        // Frozen complex templates retain an entry guard. In particular this
-        // precedes the jump-table default branch, so every outgoing edge sees
-        // the same actual barrier that the frozen event graph describes.
+        // Keep the first read in the complex template's cursor order. Its
+        // external guard belongs to the shared plan before this instruction,
+        // including before the jump-table default branch on every outgoing edge.
         if state.selective_internal()
             && matches!(
                 self,

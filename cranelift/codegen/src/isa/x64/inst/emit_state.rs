@@ -63,7 +63,10 @@ impl MachInstEmitState<Inst> for EmitState {
     fn v4_set_legacy_internal(&mut self, active: bool) {
         self.v4_legacy_internal = active;
         if active {
-            self.ssbb_dirty = true;
+            // The shared plan has checked the first access and emits any
+            // needed outer guard. Only stores/calls and retry backedges inside
+            // this expansion may require a fixed legacy guard.
+            self.ssbb_dirty = false;
             self.ssbb_suppressed = false;
         }
     }

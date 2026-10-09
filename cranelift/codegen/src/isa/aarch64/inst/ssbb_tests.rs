@@ -388,6 +388,65 @@ fn compile_policy(policy: &str, func: Function) -> Compiled {
     }
 }
 
+/// Exercise actual classifier, planner and emitter together, without VCode or
+/// frontend transformations hiding a redundant template-entry barrier.
+fn selective_boundary_native_code(insts: &[Inst]) -> (Vec<u8>, Vec<bool>, u32) {
+    use crate::isa::aarch64::inst::{EmitInfo, EmitState};
+    use crate::machinst::v4_fences::{
+        self, V4Block, V4Context, V4EventId, V4Graph, V4Node, V4Policy,
+    };
+    use crate::machinst::{MachInstEmit, MachInstEmitState};
+    let flags = settings::Flags::new(settings::builder());
+    let mut context = V4Context::new(0, V4Policy::Ranges);
+    let mut events = Vec::new();
+    let mut sequences = Vec::new();
+    for (site, inst) in insts.iter().enumerate() {
+        let seq = super::classify_v4(inst, &FrameLayout::default(), &flags, &mut context).unwrap();
+        for (sub, event) in seq.events.iter().copied().enumerate() {
+            events.push(V4Node {
+                id: V4EventId {
+                    block: 0,
+                    inst: site as u32,
+                    sub: sub as u16,
+                },
+                event,
+                guard: Some(site),
+            });
+        }
+        sequences.push(seq);
+    }
+    let graph = V4Graph {
+        blocks: vec![V4Block {
+            events,
+            successors: vec![],
+            exit_site: None,
+            loop_depth: 0,
+        }],
+        entry: 0,
+        sites: insts.len(),
+    };
+    let plan = v4_fences::plan(&graph, V4Policy::Ranges).unwrap();
+    assert!(v4_fences::check(&graph, &plan.fences).errors.is_empty());
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.v4_set_selective(true);
+    let emit_info = EmitInfo::new(flags);
+    let mut sink = MachBuffer::new();
+    for (site, (inst, seq)) in insts.iter().zip(&sequences).enumerate() {
+        if plan.fences[site] {
+            state.ssbb_emit_barrier(&mut sink, &emit_info);
+        }
+        state.v4_set_legacy_internal(seq.legacy_internal);
+        inst.emit(&mut sink, &emit_info, &mut state);
+        state.v4_set_legacy_internal(false);
+    }
+    (
+        sink.testing_data().to_vec(),
+        plan.fences,
+        sequences.iter().map(|seq| seq.fixed_barriers()).sum(),
+    )
+}
+
 fn disjoint_range_load(alias_after: bool) -> Function {
     let mut func = new_func(&[types::I64, types::I64], &[types::I64]);
     let (mut pos, vals) = entry(&mut func, &[types::I64, types::I64]);
@@ -570,15 +629,10 @@ fn selective_cfg_layout_moves_guard_after_real_store() {
     );
 }
 
-#[test]
-fn selective_internal_templates_emit_exact_fixed_guard_count() {
+fn frozen_boundary_templates() -> Vec<Inst> {
     use crate::isa::aarch64::inst::*;
-    use crate::machinst::v4_fences::{V4Context, V4Policy};
-    use crate::machinst::{MachInstEmit, MachInstEmitState};
-    let flags = settings::Flags::new(settings::builder());
-    let info = EmitInfo::new(flags.clone());
     let symbol = alloc::boxed::Box::new(ExternalName::testcase("v4"));
-    let templates = [
+    vec![
         Inst::LoadExtNameGot {
             rd: writable_xreg(0),
             name: symbol.clone(),
@@ -605,23 +659,53 @@ fn selective_internal_templates_emit_exact_fixed_guard_count() {
                 key: None,
             }),
         },
-    ];
-    for inst in templates {
+    ]
+}
+
+#[test]
+fn selective_frozen_template_entry_guards_follow_pending() {
+    use crate::isa::aarch64::inst::*;
+    use crate::machinst::MachInstEmitState;
+    use crate::machinst::v4_fences::{V4Context, V4Policy};
+    let flags = settings::Flags::new(settings::builder());
+    for inst in frozen_boundary_templates() {
         let mut context = V4Context::new(0, V4Policy::Ranges);
         let seq = super::classify_v4(&inst, &FrameLayout::default(), &flags, &mut context).unwrap();
         assert!(seq.legacy_internal, "{inst:?}");
-        let mut state = EmitState::default();
-        state.ssbb_install(&[]);
-        state.v4_set_selective(true);
-        state.v4_set_legacy_internal(true);
-        let mut sink = MachBuffer::new();
-        inst.emit(&mut sink, &info, &mut state);
         assert_eq!(
-            count_word(sink.testing_data(), SSBB),
-            seq.fixed_barriers() as usize,
-            "{inst:?}: {seq:?}"
+            seq.fixed_barriers(),
+            0,
+            "a template's first read is an external protection site: {inst:?}"
         );
-        assert_eq!(state.ssbb_barrier_count(), seq.fixed_barriers());
+        let clean = [Inst::Ssbb {}, inst.clone()];
+        let (bytes, guards, fixed) = selective_boundary_native_code(&clean);
+        assert_eq!(guards, vec![false, false], "clean template entry: {inst:?}");
+        assert_eq!(fixed, 0, "{inst:?}");
+        assert_eq!(
+            count_word(&bytes, SSBB),
+            1,
+            "only the explicit upstream fence should remain: {inst:?}"
+        );
+        let dirty = [
+            Inst::Store64 {
+                rd: xreg(1),
+                mem: AMode::reg(xreg(2)),
+                flags: MemFlags::trusted(),
+            },
+            inst.clone(),
+        ];
+        let (bytes, guards, fixed) = selective_boundary_native_code(&dirty);
+        assert_eq!(
+            guards,
+            vec![false, true],
+            "dirty template entry must be guarded by the plan: {inst:?}"
+        );
+        assert_eq!(fixed, 0, "{inst:?}");
+        assert_eq!(
+            count_word(&bytes, SSBB),
+            1,
+            "dirty entry gets exactly one external fence: {inst:?}"
+        );
     }
     // Selective ordinary emission must not reinsert the legacy automatic guard.
     let mut state = EmitState::default();
@@ -631,6 +715,186 @@ fn selective_internal_templates_emit_exact_fixed_guard_count() {
     let mut sink = MachBuffer::new();
     state.ssbb_step(SsbbMemStep::Load, &mut sink);
     assert!(sink.testing_data().is_empty());
+}
+
+#[test]
+fn selective_frozen_emitter_does_not_force_entry_guard() {
+    use crate::isa::aarch64::inst::{EmitInfo, EmitState};
+    use crate::machinst::{MachInstEmit, MachInstEmitState};
+    let info = EmitInfo::new(settings::Flags::new(settings::builder()));
+    for inst in frozen_boundary_templates() {
+        for previous_dirty in [false, true] {
+            let mut state = EmitState::default();
+            state.ssbb_install(&[]);
+            state.v4_set_selective(true);
+            state.ssbb_set_dirty(previous_dirty);
+            // Input Pending belongs to the planner. The internal emitter must
+            // start clean even if its previous lexical cursor was dirty.
+            state.v4_set_legacy_internal(true);
+            let mut sink = MachBuffer::new();
+            inst.emit(&mut sink, &info, &mut state);
+            assert_eq!(
+                count_word(sink.testing_data(), SSBB),
+                0,
+                "template emitted an unconditional entry guard: {inst:?}, previous dirty={previous_dirty}"
+            );
+            assert_eq!(state.ssbb_barrier_count(), 0);
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "disas")]
+fn selective_frozen_literal_tls_and_tail_native_boundaries() {
+    use crate::isa::aarch64::inst::{AMode, xreg};
+    let cs = target("ssbb", true, false).to_capstone().unwrap();
+    for template in frozen_boundary_templates() {
+        // The far-literal template ends with an eight-byte relocation payload.
+        // Audit those bytes as data, never as fabricated native instructions.
+        let literal_size = if matches!(template, Inst::LoadExtNameFar { .. }) {
+            8
+        } else {
+            0
+        };
+        let clean = [Inst::Ssbb {}, template.clone()];
+        let (clean_bytes, _, _) = selective_boundary_native_code(&clean);
+        let clean_code_end = clean_bytes.len() - literal_size;
+        let clean_decoded = cs.disasm_all(&clean_bytes[..clean_code_end], 0).unwrap();
+        assert_eq!(
+            clean_decoded
+                .iter()
+                .map(|inst| inst.bytes().len())
+                .sum::<usize>(),
+            clean_code_end,
+            "undecoded template code: {template:?}"
+        );
+        assert_eq!(
+            clean_decoded
+                .iter()
+                .filter(|inst| inst.bytes() == SSBB.to_le_bytes())
+                .count(),
+            1,
+            "{template:?}"
+        );
+        let dirty = [
+            Inst::Store64 {
+                rd: xreg(1),
+                mem: AMode::reg(xreg(2)),
+                flags: MemFlags::trusted(),
+            },
+            template.clone(),
+        ];
+        let (dirty_bytes, _, _) = selective_boundary_native_code(&dirty);
+        let dirty_code_end = dirty_bytes.len() - literal_size;
+        let dirty_decoded = cs.disasm_all(&dirty_bytes[..dirty_code_end], 0).unwrap();
+        assert_eq!(
+            dirty_decoded
+                .iter()
+                .map(|inst| inst.bytes().len())
+                .sum::<usize>(),
+            dirty_code_end,
+            "undecoded template code: {template:?}"
+        );
+        for instruction in clean_decoded.iter().chain(dirty_decoded.iter()) {
+            cs.insn_detail(instruction)
+                .expect("actual template code must decode as instructions, without skip-data");
+        }
+        let words = dirty_decoded.as_ref();
+        assert_eq!(words[0].mnemonic(), Some("str"));
+        assert_eq!(
+            words[1].bytes(),
+            SSBB.to_le_bytes(),
+            "dirty entry must be protected before the template: {template:?}"
+        );
+        assert_eq!(
+            words
+                .iter()
+                .filter(|inst| inst.bytes() == SSBB.to_le_bytes())
+                .count(),
+            1,
+            "{template:?}"
+        );
+        // Removing only the dirty prefix store must leave the exact same native
+        // template operations and their branch/literal layout.
+        let dirty_template = &dirty_bytes[8..dirty_code_end];
+        let clean_template = &clean_bytes[4..clean_code_end];
+        assert_eq!(dirty_template, clean_template, "{template:?}");
+        assert_eq!(
+            &dirty_bytes[dirty_code_end..],
+            &clean_bytes[clean_code_end..],
+            "literal payload changed: {template:?}"
+        );
+        if literal_size != 0 {
+            assert_eq!(
+                &clean_bytes[clean_code_end..],
+                &[0; 8],
+                "the unresolved literal relocation keeps its payload placeholder"
+            );
+        }
+    }
+}
+
+#[test]
+fn selective_clean_opaque_call_needs_no_extra_guard_but_dirty_call_does() {
+    use crate::isa::aarch64::inst::{AMode, OperandSize};
+    use crate::machinst::abi::CallInfo;
+    let load = Inst::ULoad64 {
+        rd: writable_xreg(1),
+        mem: AMode::reg(xreg(0)),
+        flags: MemFlags::trusted(),
+    };
+    let pure = Inst::Mov {
+        size: OperandSize::Size64,
+        rd: writable_xreg(3),
+        rm: xreg(1),
+    };
+    let call = Inst::CallInd {
+        info: alloc::boxed::Box::new(CallInfo::empty(xreg(2), CallConv::SystemV)),
+    };
+    let (bytes, guards, fixed) =
+        selective_boundary_native_code(&[Inst::Ssbb {}, load, pure, call.clone()]);
+    assert_eq!(guards, vec![false, false, false, false]);
+    assert_eq!(fixed, 0);
+    assert_eq!(count_word(&bytes, SSBB), 1);
+    let store = Inst::Store64 {
+        rd: xreg(1),
+        mem: AMode::reg(xreg(0)),
+        flags: MemFlags::trusted(),
+    };
+    let (bytes, guards, fixed) = selective_boundary_native_code(&[store, call]);
+    assert_eq!(guards, vec![false, true]);
+    assert_eq!(fixed, 0);
+    assert_eq!(count_word(&bytes, SSBB), 1);
+    assert_eq!(words(&bytes)[1], SSBB);
+}
+
+#[test]
+fn selective_lse_read_modify_write_keeps_post_write_load_protection() {
+    use crate::isa::aarch64::inst::AMode;
+    let load = Inst::ULoad64 {
+        rd: writable_xreg(4),
+        mem: AMode::reg(xreg(0)),
+        flags: MemFlags::trusted(),
+    };
+    let atomic = Inst::AtomicCAS {
+        rd: writable_xreg(1),
+        rs: xreg(1),
+        rt: xreg(2),
+        rn: xreg(0),
+        ty: types::I64,
+        flags: MemFlags::trusted(),
+    };
+    let (bytes, guards, fixed) =
+        selective_boundary_native_code(&[Inst::Ssbb {}, load.clone(), atomic, load]);
+    assert_eq!(guards, vec![false, false, false, true]);
+    assert_eq!(fixed, 0);
+    assert_eq!(count_word(&bytes, SSBB), 2);
+    assert!(
+        words(&bytes)
+            .windows(2)
+            .any(|pair| is_cas(pair[0]) && pair[1] == SSBB),
+        "CAS writes must guard the following aliasing load"
+    );
 }
 
 #[test]
@@ -658,9 +922,13 @@ fn selective_try_call_cut_precedes_spilled_return_loads() {
     let flags = settings::Flags::new(settings::builder());
     let mut context = V4Context::new(0, V4Policy::Ranges);
     let seq = super::classify_v4(&inst, &FrameLayout::default(), &flags, &mut context).unwrap();
-    assert_eq!(seq.exn_cut, Some(1));
+    assert_eq!(seq.exn_cut, Some(0));
     assert_eq!(seq.events[seq.exn_cut.unwrap()], V4Event::OpaqueCall);
-    assert_eq!(seq.fixed_barriers(), 3, "{seq:?}");
+    assert_eq!(
+        seq.fixed_barriers(),
+        2,
+        "only the two call/store-to-return-load transitions are fixed: {seq:?}"
+    );
     assert!(
         seq.events
             .iter()
@@ -674,7 +942,8 @@ fn selective_try_call_cut_precedes_spilled_return_loads() {
     inst.emit(&mut sink, &EmitInfo::new(flags), &mut state);
     assert_eq!(
         count_word(sink.testing_data(), SSBB),
-        seq.fixed_barriers() as usize
+        2,
+        "a clean call entry still protects both spilled return loads"
     );
 }
 

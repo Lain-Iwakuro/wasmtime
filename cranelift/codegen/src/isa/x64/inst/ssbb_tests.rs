@@ -8,6 +8,7 @@ use crate::ir::{
 };
 use crate::isa::{self, CallConv};
 use crate::settings::{self, Configurable};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use cranelift_control::ControlPlane;
 
@@ -208,7 +209,7 @@ fn selective_atomic_keeps_internal_retry_guards_and_suppresses_ordinary_auto_gua
     )
     .unwrap();
     assert!(seq.legacy_internal);
-    assert_eq!(seq.fixed_barriers(), 2);
+    assert_eq!(seq.fixed_barriers(), 1);
     let mut state = EmitState::default();
     state.ssbb_install(&[]);
     state.v4_set_selective(true);
@@ -231,7 +232,7 @@ fn selective_atomic_keeps_internal_retry_guards_and_suppresses_ordinary_auto_gua
         .finish(&Default::default(), &mut ControlPlane::default())
         .data()
         .to_vec();
-    assert_eq!(fences(&bytes), 3, "{bytes:02x?}");
+    assert_eq!(fences(&bytes), 2, "{bytes:02x?}");
     let cas = bytes
         .windows(3)
         .position(|b| b == [0xf0, 0x0f, 0xb0])
@@ -386,10 +387,17 @@ fn selective_native_plan(
     insts: &[super::Inst],
     policy: crate::machinst::v4_fences::V4Policy,
 ) -> (Vec<u8>, Vec<bool>) {
+    selective_native_plan_with_frame(insts, policy, super::FrameLayout::default())
+}
+
+fn selective_native_plan_with_frame(
+    insts: &[super::Inst],
+    policy: crate::machinst::v4_fences::V4Policy,
+    frame: super::FrameLayout,
+) -> (Vec<u8>, Vec<bool>) {
     use super::*;
     use crate::machinst::v4_fences::{self, V4Block, V4Context, V4EventId, V4Graph, V4Node};
     let info = raw_info();
-    let frame = FrameLayout::default();
     let mut context = V4Context::new(0, policy);
     context.external_entry = true;
     let sequences: Vec<_> = insts
@@ -406,7 +414,9 @@ fn selective_native_plan(
                     sub: sub as u16,
                 },
                 event,
-                guard: (!seq.legacy_internal).then_some(inst),
+                // An expansion's first access is protected at its outer native
+                // boundary; only its actual internal guards are frozen.
+                guard: Some(inst),
             });
         }
     }
@@ -423,6 +433,7 @@ fn selective_native_plan(
     let plan = v4_fences::plan(&graph, policy).unwrap();
     assert!(v4_fences::check(&graph, &plan.fences).errors.is_empty());
     let mut state = EmitState::default();
+    state.frame_layout = frame;
     state.ssbb_install(&[]);
     state.v4_set_selective(true);
     let mut sink = MachBuffer::<Inst>::new();
@@ -440,6 +451,424 @@ fn selective_native_plan(
             .to_vec(),
         plan.fences,
     )
+}
+
+fn selective_call_info<T>(dest: T) -> Box<super::CallInfo<T>> {
+    use super::*;
+    Box::new(CallInfo {
+        dest,
+        uses: smallvec![],
+        defs: smallvec![],
+        clobbers: Default::default(),
+        callee_conv: CallConv::SystemV,
+        caller_conv: CallConv::SystemV,
+        callee_pop_size: 0,
+        try_call_info: None,
+        patchable: false,
+    })
+}
+
+#[test]
+fn selective_clean_load_and_pure_sequence_does_not_add_call_entry_fence() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let insts = [
+        Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        },
+        Inst::External {
+            inst: asm::inst::movq_rm::new(
+                Writable::from_reg(Gpr::RAX),
+                Amode::imm_reg(0, regs::rdi()),
+            )
+            .into(),
+        },
+        Inst::addq_mi(Writable::from_reg(regs::rax()), 7),
+        Inst::CallKnown {
+            info: selective_call_info(ExternalName::LibCall(LibCall::Memcpy)),
+        },
+    ];
+    for policy in [V4Policy::Frame, V4Policy::Ranges, V4Policy::RangesCfg] {
+        let (bytes, plan) = selective_native_plan(&insts, policy);
+        assert_eq!(
+            fences(&bytes),
+            1,
+            "clean call gained a redundant guard: {bytes:02x?}"
+        );
+        assert_eq!(plan, [false; 4]);
+        assert_eq!(&bytes[bytes.len() - 5..], &[0xe8, 0, 0, 0, 0]);
+        assert_eq!(&bytes[3..6], &[0x48, 0x8b, 0x07]);
+    }
+}
+
+#[test]
+fn selective_store_before_call_still_emits_call_entry_fence() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let insts = [
+        Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        },
+        Inst::External {
+            inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rdi()), Gpr::RSI).into(),
+        },
+        Inst::CallKnown {
+            info: selective_call_info(ExternalName::LibCall(LibCall::Memcpy)),
+        },
+    ];
+    let (bytes, _) = selective_native_plan(&insts, V4Policy::Ranges);
+    assert_eq!(
+        bytes,
+        [
+            0x0f, 0xae, 0xe8, 0x48, 0x89, 0x37, 0x0f, 0xae, 0xe8, 0xe8, 0, 0, 0, 0
+        ]
+    );
+}
+
+#[test]
+fn selective_memory_call_target_is_read_and_guarded_at_native_call_boundary() {
+    use super::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy};
+    for dirty in [false, true] {
+        let call = Inst::CallUnknown {
+            info: selective_call_info(RegMem::Mem {
+                addr: SyntheticAmode::real(Amode::imm_reg(0, regs::rdi())),
+            }),
+        };
+        let seq = super::ssbb::classify_v4(
+            &call,
+            &FrameLayout::default(),
+            &raw_info(),
+            &mut V4Context::new(0, V4Policy::Ranges),
+        )
+        .unwrap();
+        let target = seq
+            .events
+            .iter()
+            .position(|event| matches!(event, V4Event::Load(_)))
+            .expect("indirect memory target must be modeled before the call");
+        let opaque = seq
+            .events
+            .iter()
+            .position(|event| *event == V4Event::OpaqueCall)
+            .unwrap();
+        assert!(target < opaque);
+        let mut insts = vec![Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        }];
+        if dirty {
+            insts.push(Inst::External {
+                inst: asm::inst::movq_mr::new(Amode::imm_reg(8, regs::rdi()), Gpr::RSI).into(),
+            });
+        }
+        insts.push(call);
+        let (bytes, _) = selective_native_plan(&insts, V4Policy::Ranges);
+        assert_eq!(fences(&bytes), 1 + usize::from(dirty), "{bytes:02x?}");
+        assert_eq!(&bytes[bytes.len() - 2..], &[0xff, 0x17]);
+        if dirty {
+            assert_eq!(
+                &bytes[bytes.len() - 5..bytes.len() - 2],
+                &[0x0f, 0xae, 0xe8]
+            );
+        }
+    }
+}
+
+#[test]
+fn selective_call_stack_return_keeps_only_the_real_internal_guard() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let mut call = selective_call_info(RegMem::Reg { reg: regs::rax() });
+    call.defs.push(CallRetPair {
+        vreg: Writable::from_reg(regs::rdx()),
+        location: RetLocation::Stack(StackAMode::Slot(0), types::I64),
+    });
+    let insts = [
+        Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        },
+        Inst::CallUnknown { info: call },
+    ];
+    let (bytes, _) = selective_native_plan(&insts, V4Policy::Ranges);
+    assert_eq!(
+        bytes,
+        [
+            0x0f, 0xae, 0xe8, 0xff, 0xd0, 0x0f, 0xae, 0xe8, 0x48, 0x8b, 0x14, 0x24
+        ]
+    );
+}
+
+#[test]
+fn selective_tls_templates_do_not_freeze_clean_entry_guards() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let symbol = ExternalName::LibCall(LibCall::ElfTlsGetAddr);
+    for template in [
+        Inst::ElfTlsGetAddr {
+            symbol: symbol.clone(),
+            dst: Writable::from_reg(Gpr::RAX),
+        },
+        Inst::MachOTlsGetAddr {
+            symbol: symbol.clone(),
+            dst: Writable::from_reg(Gpr::RAX),
+        },
+        Inst::CoffTlsGetAddr {
+            symbol,
+            dst: Writable::from_reg(Gpr::RAX),
+            tmp: Writable::from_reg(Gpr::RCX),
+        },
+    ] {
+        // These linker templates have no store->load inside the expansion.
+        // The existing legacy emitter provides an independent exact byte
+        // reference for their clean native sequence.
+        let reference = emit_raw(&[template.clone()], false);
+        assert_eq!(fences(&reference), 0);
+        for dirty in [false, true] {
+            let mut insts = vec![Inst::External {
+                inst: asm::inst::lfence_zo::new().into(),
+            }];
+            if dirty {
+                insts.push(Inst::External {
+                    inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rdi()), Gpr::RSI).into(),
+                });
+            }
+            insts.push(template.clone());
+            let (bytes, _) = selective_native_plan(&insts, V4Policy::Ranges);
+            assert_eq!(
+                fences(&bytes),
+                1 + usize::from(dirty),
+                "{template:?}: {bytes:02x?}"
+            );
+            assert_eq!(
+                &bytes[bytes.len() - reference.len()..],
+                reference.as_slice(),
+                "the linker template must remain contiguous"
+            );
+            if dirty {
+                assert_eq!(
+                    &bytes[bytes.len() - reference.len() - 3..bytes.len() - reference.len()],
+                    &[0x0f, 0xae, 0xe8]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn selective_tail_argument_template_keeps_internal_guard_without_clean_entry_guard() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let frame = FrameLayout {
+        tail_args_size: 16,
+        ..FrameLayout::default()
+    };
+    let tail = Inst::ReturnCallKnown {
+        info: Box::new(ReturnCallInfo {
+            dest: ExternalName::LibCall(LibCall::Memcpy),
+            new_stack_arg_size: 0,
+            uses: smallvec![],
+            tmp: Writable::from_reg(Gpr::R11),
+        }),
+    };
+    for dirty in [false, true] {
+        let mut insts = vec![Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        }];
+        if dirty {
+            insts.push(Inst::External {
+                inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rdi()), Gpr::RSI).into(),
+            });
+        }
+        insts.push(tail.clone());
+        let (bytes, _) = selective_native_plan_with_frame(&insts, V4Policy::Ranges, frame.clone());
+        assert_eq!(fences(&bytes), 2 + usize::from(dirty), "{bytes:02x?}");
+        assert_eq!(
+            &bytes[bytes.len() - 8..],
+            &[0x0f, 0xae, 0xe8, 0xe9, 0, 0, 0, 0]
+        );
+        assert!(
+            bytes.windows(3).any(|bytes| bytes == [0x4c, 0x8b, 0x1c]),
+            "tail template must still read the native return address"
+        );
+    }
+}
+
+#[test]
+fn selective_clean_atomic_entry_keeps_retry_backedge_guard() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let atomic = Inst::AtomicRmwSeq {
+        ty: types::I64,
+        op: AtomicRmwSeqOp::Nand,
+        mem: SyntheticAmode::real(Amode::imm_reg(0, regs::rdi())),
+        operand: Gpr::RSI,
+        temp: Writable::from_reg(Gpr::RDX),
+        dst_old: Writable::from_reg(Gpr::RAX),
+    };
+    for dirty in [false, true] {
+        let mut insts = vec![Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        }];
+        if dirty {
+            insts.push(Inst::External {
+                inst: asm::inst::movq_mr::new(Amode::imm_reg(8, regs::rdi()), Gpr::RSI).into(),
+            });
+        }
+        if !dirty {
+            insts.push(Inst::External {
+                inst: asm::inst::movq_rm::new(
+                    Writable::from_reg(Gpr::R8),
+                    Amode::imm_reg(8, regs::rdi()),
+                )
+                .into(),
+            });
+        }
+        insts.push(atomic.clone());
+        let (bytes, _) = selective_native_plan(&insts, V4Policy::Ranges);
+        assert_eq!(fences(&bytes), 2 + usize::from(dirty), "{bytes:02x?}");
+        let cas = bytes
+            .windows(4)
+            .position(|bytes| bytes == [0xf0, 0x48, 0x0f, 0xb1])
+            .unwrap();
+        assert_eq!(&bytes[cas - 3..cas], &[0x0f, 0xae, 0xe8]);
+        let branch = bytes
+            .windows(2)
+            .position(|bytes| bytes == [0x0f, 0x85])
+            .unwrap();
+        let displacement = i32::from_le_bytes(bytes[branch + 2..branch + 6].try_into().unwrap());
+        let target = (branch as i32 + 6 + displacement) as usize;
+        assert!(
+            target <= cas - 3 && target > 3,
+            "retry must execute its internal guard: {bytes:02x?}"
+        );
+    }
+}
+
+#[test]
+fn selective_try_call_cut_and_native_return_load_guard_stay_after_actual_call() {
+    use super::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy};
+    let info = raw_info();
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.v4_set_selective(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    let continuation = sink.get_label();
+    let handler = sink.get_label();
+    let mut call = selective_call_info(ExternalName::LibCall(LibCall::Memcpy));
+    call.defs.push(CallRetPair {
+        vreg: Writable::from_reg(regs::rdx()),
+        location: RetLocation::Stack(StackAMode::Slot(0), types::I64),
+    });
+    call.try_call_info = Some(TryCallInfo {
+        continuation,
+        exception_handlers: vec![TryCallHandler::Default(handler)].into_boxed_slice(),
+    });
+    let inst = Inst::CallKnown { info: call };
+    let seq = super::ssbb::classify_v4(
+        &inst,
+        state.frame_layout(),
+        &info,
+        &mut V4Context::new(0, V4Policy::Ranges),
+    )
+    .unwrap();
+    let cut = seq.exn_cut.unwrap();
+    assert_eq!(seq.events[cut], V4Event::OpaqueCall);
+    assert!(
+        seq.events
+            .iter()
+            .skip(cut + 1)
+            .any(|event| matches!(event, V4Event::Load(_)))
+    );
+    state.ssbb_emit_barrier(&mut sink, &info);
+    state.v4_set_legacy_internal(seq.legacy_internal);
+    inst.emit(&mut sink, &info, &mut state);
+    state.v4_set_legacy_internal(false);
+    sink.bind_label(handler, state.ctrl_plane_mut());
+    let handler_offset = sink.cur_offset();
+    state.ssbb_emit_barrier(&mut sink, &info);
+    Inst::External {
+        inst: asm::inst::retq_zo::new().into(),
+    }
+    .emit(&mut sink, &info, &mut state);
+    sink.bind_label(continuation, state.ctrl_plane_mut());
+    Inst::External {
+        inst: asm::inst::retq_zo::new().into(),
+    }
+    .emit(&mut sink, &info, &mut state);
+    let code = sink.finish(&Default::default(), &mut ControlPlane::default());
+    assert_eq!(
+        &code.data()[..15],
+        &[
+            0x0f, 0xae, 0xe8, 0xe8, 0, 0, 0, 0, 0x0f, 0xae, 0xe8, 0x48, 0x8b, 0x14, 0x24
+        ]
+    );
+    assert_eq!(code.call_sites().next().unwrap().ret_addr, 8);
+    assert_eq!(
+        code.call_sites().next().unwrap().exception_handlers,
+        &[crate::machinst::FinalizedMachExceptionHandler::Default(
+            handler_offset
+        )]
+    );
+    assert_eq!(fences(code.data()), 3);
+}
+
+#[test]
+fn selective_memory_try_call_cut_includes_target_read_and_actual_call() {
+    use super::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy};
+    let info = raw_info();
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.v4_set_selective(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    let continuation = sink.get_label();
+    let handler = sink.get_label();
+    let mut call = selective_call_info(RegMem::Mem {
+        addr: SyntheticAmode::real(Amode::imm_reg(0, regs::rdi())),
+    });
+    call.try_call_info = Some(TryCallInfo {
+        continuation,
+        exception_handlers: vec![TryCallHandler::Default(handler)].into_boxed_slice(),
+    });
+    let inst = Inst::CallUnknown { info: call };
+    let seq = super::ssbb::classify_v4(
+        &inst,
+        state.frame_layout(),
+        &info,
+        &mut V4Context::new(0, V4Policy::Ranges),
+    )
+    .unwrap();
+    assert!(matches!(seq.events[0], V4Event::Load(_)));
+    assert_eq!(seq.exn_cut, Some(1));
+    assert_eq!(seq.events[1], V4Event::OpaqueCall);
+    state.ssbb_emit_barrier(&mut sink, &info);
+    state.v4_set_legacy_internal(seq.legacy_internal);
+    inst.emit(&mut sink, &info, &mut state);
+    state.v4_set_legacy_internal(false);
+    sink.bind_label(handler, state.ctrl_plane_mut());
+    let handler_offset = sink.cur_offset();
+    state.ssbb_emit_barrier(&mut sink, &info);
+    Inst::External {
+        inst: asm::inst::retq_zo::new().into(),
+    }
+    .emit(&mut sink, &info, &mut state);
+    sink.bind_label(continuation, state.ctrl_plane_mut());
+    state.ssbb_emit_barrier(&mut sink, &info);
+    Inst::External {
+        inst: asm::inst::retq_zo::new().into(),
+    }
+    .emit(&mut sink, &info, &mut state);
+    let code = sink.finish(&Default::default(), &mut ControlPlane::default());
+    assert_eq!(&code.data()[..5], &[0x0f, 0xae, 0xe8, 0xff, 0x17]);
+    assert_eq!(code.call_sites().next().unwrap().ret_addr, 5);
+    assert_eq!(
+        code.call_sites().next().unwrap().exception_handlers,
+        &[crate::machinst::FinalizedMachExceptionHandler::Default(
+            handler_offset
+        )]
+    );
+    assert_eq!(fences(code.data()), 3);
 }
 
 #[test]

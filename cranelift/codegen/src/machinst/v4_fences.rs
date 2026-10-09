@@ -58,7 +58,8 @@ pub struct V4Seq {
     /// Inclusive exception cut; last successor uses the full sequence.
     pub exn_cut: Option<usize>,
     /// This expansion emits its unchanged conservative internal guards.
-    /// Its emitter must start legacy dirty=true even when the outer plan is clean.
+    /// Its emitter starts clean; the containing instruction's optional guard
+    /// handles incoming Pending, while only actual internal guards are frozen.
     pub legacy_internal: bool,
 }
 
@@ -71,12 +72,12 @@ impl V4Seq {
         }
     }
 
-    /// Preserve all legacy expansion guards as fixed events, including an
-    /// unconditional entry guard when its first operation reads memory.
+    /// Preserve legacy guards required after the expansion has started. The
+    /// first read remains visible to the checker as an external guard site.
     pub fn frozen_legacy(seq: &SsbbSeq) -> Self {
         let mut result = Self::neutral();
         result.legacy_internal = true;
-        let mut dirty = true;
+        let mut dirty = false;
         for (i, step) in seq.steps.iter().copied().enumerate() {
             if SsbbSeq::needs_guard(dirty, step) {
                 result
@@ -237,6 +238,39 @@ pub struct V4Graph {
     pub sites: usize,
 }
 
+/// Actual historical guard sites, replayed from original `SsbbSeq`s and the
+/// original `SsbbPlan` block states, never regenerated on the selective graph.
+#[derive(Clone, Debug)]
+pub struct V4Baseline {
+    pub fences: Vec<bool>,
+    pub fixed_internal_fences: usize,
+}
+
+/// Replay one original instruction. The only difference between dirty and
+/// clean entry can be a single external guard before the first read. All other
+/// historical guards must match the fixed internal selective events exactly.
+pub fn replay_legacy_instruction(
+    sequence: &SsbbSeq,
+    effects: &V4Seq,
+    dirty: &mut bool,
+) -> crate::CodegenResult<bool> {
+    let internal = SsbbSeq::count_barriers(false, &sequence.steps);
+    let actual = SsbbSeq::count_barriers(*dirty, &sequence.steps);
+    if internal != effects.fixed_barriers() || actual < internal || actual - internal > 1 {
+        return Err(crate::CodegenError::Unsupported(format!(
+            "Spectre-v4 actual legacy guard mismatch: old={sequence:?}, entry_dirty={dirty}, clean_internal={internal}, actual={actual}, selective={effects:?}"
+        )));
+    }
+    *dirty = SsbbSeq::transfer(*dirty, &sequence.steps);
+    Ok(actual > internal)
+}
+
+#[derive(Clone, Debug)]
+pub struct V4CfgMove {
+    pub removed_site: usize,
+    pub added_sites: Vec<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct V4Plan {
     pub fences: Vec<bool>,
@@ -244,6 +278,11 @@ pub struct V4Plan {
     pub solve_count: usize,
     pub fallback: Option<&'static str>,
     pub moved: usize,
+    pub cfg_moves: Vec<V4CfgMove>,
+    pub cfg_added_sites: Vec<usize>,
+    pub cfg_removed_sites: Vec<usize>,
+    pub baseline_added_sites: Vec<usize>,
+    pub baseline_removed_sites: Vec<usize>,
     pub unknown_reasons: Vec<UnknownReason>,
 }
 
@@ -661,6 +700,7 @@ pub fn check(graph: &V4Graph, fences: &[bool]) -> V4Check {
     }
 }
 
+#[cfg(test)]
 fn legacy_plan(graph: &V4Graph) -> Vec<bool> {
     let transfer = |mut dirty: bool, block: &V4Block| {
         let mut states = Vec::new();
@@ -805,28 +845,73 @@ pub fn assign_loop_depths(graph: &mut V4Graph) {
     }
 }
 
+/// Synthetic fixtures may construct their own boolean legacy approximation.
+/// Production callers must provide the original historical replay instead.
+#[cfg(test)]
 pub fn plan(graph: &V4Graph, policy: V4Policy) -> crate::CodegenResult<V4Plan> {
     plan_with_budget(graph, policy, SOLVE_LIMIT)
 }
 
+#[cfg(test)]
 fn plan_with_budget(
     graph: &V4Graph,
     policy: V4Policy,
     budget: usize,
 ) -> crate::CodegenResult<V4Plan> {
+    let baseline = V4Baseline {
+        fences: legacy_plan(graph),
+        fixed_internal_fences: fixed_internal_count(graph),
+    };
+    plan_baseline_with_budget(graph, policy, &baseline, budget)
+}
+
+fn fixed_internal_count(graph: &V4Graph) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.events)
+        .filter(|node| node.event == V4Event::Barrier(V4BarrierOrigin::LegacyInternal))
+        .count()
+}
+
+pub fn plan_with_baseline(
+    graph: &V4Graph,
+    policy: V4Policy,
+    baseline: &V4Baseline,
+) -> crate::CodegenResult<V4Plan> {
+    plan_baseline_with_budget(graph, policy, baseline, SOLVE_LIMIT)
+}
+
+fn plan_baseline_with_budget(
+    graph: &V4Graph,
+    policy: V4Policy,
+    baseline: &V4Baseline,
+    budget: usize,
+) -> crate::CodegenResult<V4Plan> {
     assert!(budget >= 2);
-    let legacy = legacy_plan(graph);
-    let baseline = check(graph, &legacy);
-    if let Some(error) = baseline.errors.first() {
+    if baseline.fences.len() != graph.sites
+        || baseline.fixed_internal_fences != fixed_internal_count(graph)
+    {
         return Err(crate::CodegenError::Unsupported(format!(
-            "Spectre-v4 conservative baseline failed: {error:?}"
+            "Spectre-v4 actual baseline shape/fixed guard mismatch: sites={}, baseline_sites={}, fixed={}, baseline_fixed={}",
+            graph.sites,
+            baseline.fences.len(),
+            fixed_internal_count(graph),
+            baseline.fixed_internal_fences
         )));
     }
-    let legacy_fences = legacy.iter().filter(|fence| **fence).count();
+    let checked_baseline = check(graph, &baseline.fences);
+    if let Some(error) = checked_baseline.errors.first() {
+        return Err(crate::CodegenError::Unsupported(format!(
+            "Spectre-v4 actual legacy baseline failed: {error:?}"
+        )));
+    }
+    let legacy_fences = baseline.fences.iter().filter(|fence| **fence).count();
     let mut count = 1;
     let mut fallback = None;
     let mut moved = 0;
-    let mut saved = legacy;
+    let mut cfg_moves = Vec::new();
+    let mut saved = baseline.fences.clone();
     let mut candidate = vec![false; graph.sites];
     let order = reverse_postorder(graph);
     while count < budget - 1 {
@@ -876,6 +961,15 @@ fn plan_with_budget(
             }
         }
     }
+    // Apply the historical total upper bound before CFG placement, including
+    // for RangesCfg: every subsequent increase must come from a recorded move.
+    // Fixed internal guards are identical in both plans by the checks above.
+    if saved.iter().filter(|f| **f).count() > legacy_fences {
+        saved = baseline.fences.clone();
+        fallback =
+            Some("range plan exceeds actual legacy total; verified actual baseline retained");
+    }
+    let pre_cfg_sites = saved.clone();
     if policy == V4Policy::RangesCfg && count < budget - 1 {
         let initial_sites = saved.clone();
         let extra_limit = 8.max(saved.iter().filter(|f| **f).count());
@@ -936,8 +1030,8 @@ fn plan_with_budget(
             }
             let mut trial = saved.clone();
             trial[site] = false;
-            for dirty in dirty_sites {
-                trial[dirty] = true;
+            for dirty in &dirty_sites {
+                trial[*dirty] = true;
             }
             if trial
                 .iter()
@@ -957,6 +1051,13 @@ fn plan_with_budget(
             let checked = check(graph, &trial);
             count += 1;
             if checked.errors.is_empty() {
+                cfg_moves.push(V4CfgMove {
+                    removed_site: site,
+                    added_sites: dirty_sites
+                        .into_iter()
+                        .filter(|site| !saved[*site])
+                        .collect(),
+                });
                 saved = trial;
                 moved += 1;
             }
@@ -970,12 +1071,32 @@ fn plan_with_budget(
             "Spectre-v4 final publication verification failed: {error:?}"
         )));
     }
+    let differences = |old: &[bool]| {
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        for (site, (new, old)) in saved.iter().zip(old).enumerate() {
+            if *new && !*old {
+                added.push(site);
+            }
+            if !*new && *old {
+                removed.push(site);
+            }
+        }
+        (added, removed)
+    };
+    let (cfg_added_sites, cfg_removed_sites) = differences(&pre_cfg_sites);
+    let (baseline_added_sites, baseline_removed_sites) = differences(&baseline.fences);
     Ok(V4Plan {
         fences: saved,
         legacy_fences,
         solve_count: count,
         fallback,
         moved,
+        cfg_moves,
+        cfg_added_sites,
+        cfg_removed_sites,
+        baseline_added_sites,
+        baseline_removed_sites,
         unknown_reasons: final_check.unknown_reasons,
     })
 }
@@ -1042,6 +1163,240 @@ mod tests {
     use super::*;
     use alloc::vec;
     use regalloc2::{PReg, RegClass};
+
+    #[test]
+    fn frozen_entry_guard_is_conditional_and_first_read_is_exposed() {
+        for steps in [
+            vec![SsbbMemStep::Load],
+            vec![SsbbMemStep::Call],
+            vec![SsbbMemStep::Load, SsbbMemStep::Call],
+            vec![SsbbMemStep::Atomic],
+        ] {
+            let legacy = SsbbSeq {
+                steps: steps.into(),
+                exn_cut: None,
+            };
+            let frozen = V4Seq::frozen_legacy(&legacy);
+            assert_eq!(frozen.fixed_barriers(), 0, "{legacy:?}: {frozen:?}");
+            assert!(matches!(
+                frozen.events[0],
+                V4Event::Load(_) | V4Event::OpaqueCall | V4Event::Rmw(_, _)
+            ));
+            let mut events = vec![V4Event::Barrier(V4BarrierOrigin::Upstream)];
+            events.extend(frozen.events.iter().copied());
+            let clean = graph(events);
+            assert!(check(&clean, &vec![false; clean.sites]).errors.is_empty());
+            let mut events = vec![V4Event::Store(frame(0, 8))];
+            events.extend(frozen.events);
+            let dirty = graph(events);
+            assert!(
+                !check(&dirty, &vec![false; dirty.sites]).errors.is_empty(),
+                "dirty input must remain exposed to the checker"
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_stack_returns_keep_only_true_internal_guards_and_call_cut() {
+        let legacy = SsbbSeq {
+            steps: vec![
+                SsbbMemStep::Call,
+                SsbbMemStep::Load,
+                SsbbMemStep::Store,
+                SsbbMemStep::Load,
+                SsbbMemStep::Store,
+            ]
+            .into(),
+            exn_cut: Some(0),
+        };
+        let frozen = V4Seq::frozen_legacy(&legacy);
+        assert_eq!(frozen.fixed_barriers(), 2);
+        assert_eq!(
+            frozen.exn_cut,
+            Some(0),
+            "exception edge must stop immediately after the actual call"
+        );
+        assert_eq!(frozen.events[0], V4Event::OpaqueCall);
+        assert_eq!(
+            SsbbSeq::count_barriers(false, &legacy.steps),
+            frozen.fixed_barriers()
+        );
+        let mut events = vec![V4Event::Barrier(V4BarrierOrigin::Upstream)];
+        events.extend(frozen.events);
+        events.push(V4Event::Load(V4Range::Unknown));
+        let g = graph(events);
+        assert!(
+            !check(&g, &vec![false; g.sites]).errors.is_empty(),
+            "a stack-result store or call return remains pending"
+        );
+    }
+
+    #[test]
+    fn frozen_retry_keeps_backedge_guard_without_fixed_entry_or_fake_store() {
+        let legacy = SsbbSeq {
+            steps: vec![SsbbMemStep::Load, SsbbMemStep::Store, SsbbMemStep::Atomic].into(),
+            exn_cut: None,
+        };
+        let mut frozen = V4Seq::frozen_legacy(&legacy);
+        // The backend removes the old state-only retry Store marker.
+        frozen
+            .events
+            .retain(|event| !matches!(event, V4Event::Store(_)));
+        assert_eq!(frozen.fixed_barriers(), 1);
+        assert_eq!(frozen.events[0], V4Event::Load(V4Range::Unknown));
+        assert!(matches!(frozen.events.last(), Some(V4Event::Rmw(_, _))));
+        let mut events = vec![V4Event::Barrier(V4BarrierOrigin::Upstream)];
+        events.extend(frozen.events);
+        events.push(V4Event::Load(V4Range::Unknown));
+        let g = graph(events);
+        assert!(
+            !check(&g, &vec![false; g.sites]).errors.is_empty(),
+            "RMW writes must survive the retry expansion"
+        );
+    }
+
+    #[test]
+    fn frame_ranges_total_is_bounded_by_real_legacy_state_replay() {
+        let call = SsbbSeq {
+            steps: vec![SsbbMemStep::Call].into(),
+            exn_cut: None,
+        };
+        let frozen = V4Seq::frozen_legacy(&call);
+        let mut events = vec![
+            V4Event::Barrier(V4BarrierOrigin::Upstream),
+            V4Event::Load(V4Range::Unknown),
+            V4Event::Pure,
+        ];
+        events.extend(frozen.events.iter().copied());
+        events.push(V4Event::Load(V4Range::Unknown));
+        let g = graph(events);
+        // This is the actual historical emitter trace, not a plan regenerated
+        // on a graph after newly added fixed entry guards.
+        let original_steps = [
+            SsbbMemStep::Clear,
+            SsbbMemStep::Load,
+            SsbbMemStep::Call,
+            SsbbMemStep::Load,
+        ];
+        let original_count = SsbbSeq::count_barriers(true, &original_steps) as usize;
+        assert_eq!(original_count, 1);
+        for policy in [V4Policy::Frame, V4Policy::Ranges] {
+            let p = plan(&g, policy).unwrap();
+            let emitted =
+                p.fences.iter().filter(|fence| **fence).count() + frozen.fixed_barriers() as usize;
+            assert!(
+                emitted <= original_count,
+                "{policy:?}: emitted={emitted}, real legacy={original_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_cfg_replanning_does_not_spread_one_legacy_guard_into_two() {
+        let g = V4Graph {
+            blocks: vec![
+                block(
+                    vec![
+                        V4Event::Barrier(V4BarrierOrigin::Upstream),
+                        V4Event::Store(frame(0, 8)),
+                        V4Event::Load(frame(16, 8)),
+                        V4Event::Pure,
+                    ],
+                    &[1, 2],
+                    0,
+                ),
+                block(vec![V4Event::Load(frame(0, 8))], &[], 4),
+                block(vec![V4Event::Load(frame(0, 8))], &[], 5),
+            ],
+            entry: 0,
+            sites: 6,
+        };
+        // Historical emission guards the first load, clearing both successors.
+        let real_legacy = [false, false, true, false, false, false];
+        assert!(check(&g, &real_legacy).errors.is_empty());
+        for policy in [V4Policy::Frame, V4Policy::Ranges] {
+            let planned = plan_with_baseline(
+                &g,
+                policy,
+                &V4Baseline {
+                    fences: real_legacy.to_vec(),
+                    fixed_internal_fences: 0,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                planned.fences.iter().filter(|fence| **fence).count(),
+                1,
+                "{policy:?} cannot replace one real guard with guards on both paths"
+            );
+            assert_eq!(planned.fences, real_legacy);
+            assert!(planned.fallback.is_some(), "cost fallback must be reported");
+        }
+    }
+
+    #[test]
+    fn actual_legacy_replay_separates_entry_and_fixed_internal_guards() {
+        let sequence = SsbbSeq {
+            steps: vec![
+                SsbbMemStep::Call,
+                SsbbMemStep::Load,
+                SsbbMemStep::Store,
+                SsbbMemStep::Load,
+            ]
+            .into(),
+            exn_cut: Some(0),
+        };
+        let effects = V4Seq::frozen_legacy(&sequence);
+        let mut clean = false;
+        assert!(!replay_legacy_instruction(&sequence, &effects, &mut clean).unwrap());
+        assert!(!clean);
+        let mut dirty = true;
+        assert!(replay_legacy_instruction(&sequence, &effects, &mut dirty).unwrap());
+        assert!(!dirty);
+        assert_eq!(effects.fixed_barriers(), 2);
+        assert_eq!(effects.exn_cut, Some(0));
+
+        let mut broken = effects.clone();
+        broken
+            .events
+            .insert(0, V4Event::Barrier(V4BarrierOrigin::LegacyInternal));
+        assert!(replay_legacy_instruction(&sequence, &broken, &mut false).is_err());
+        broken = effects.clone();
+        broken
+            .events
+            .retain(|event| !matches!(event, V4Event::Barrier(_)));
+        assert!(replay_legacy_instruction(&sequence, &broken, &mut true).is_err());
+    }
+
+    #[test]
+    fn actual_baseline_is_verified_and_budget_fallback_uses_exact_guard_sites() {
+        let g = graph(vec![
+            V4Event::Barrier(V4BarrierOrigin::Upstream),
+            V4Event::Store(frame(0, 8)),
+            V4Event::Load(frame(16, 8)),
+            V4Event::Load(frame(0, 8)),
+        ]);
+        let baseline = V4Baseline {
+            fences: vec![false, false, true, false],
+            fixed_internal_fences: 0,
+        };
+        let p = plan_baseline_with_budget(&g, V4Policy::RangesCfg, &baseline, 2).unwrap();
+        assert_eq!(p.fences, baseline.fences);
+        assert_eq!(p.solve_count, 2);
+        assert!(p.cfg_moves.is_empty());
+        assert!(p.baseline_added_sites.is_empty());
+        assert!(p.baseline_removed_sites.is_empty());
+
+        let mut broken = baseline.clone();
+        broken.fences[2] = false;
+        assert!(plan_with_baseline(&g, V4Policy::Ranges, &broken).is_err());
+        broken = baseline.clone();
+        broken.fixed_internal_fences = 1;
+        assert!(plan_with_baseline(&g, V4Policy::Ranges, &broken).is_err());
+        broken = baseline.clone();
+        broken.fences.pop();
+        assert!(plan_with_baseline(&g, V4Policy::Ranges, &broken).is_err());
+    }
 
     fn reg() -> Reg {
         Reg::from_real_reg(PReg::new(0, RegClass::Int))
@@ -1283,6 +1638,13 @@ mod tests {
         assert!(plan.fences[2]);
         assert!(!plan.fences[4]);
         assert_eq!(plan.moved, 1);
+        assert_eq!(plan.cfg_moves.len(), 1);
+        assert_eq!(plan.cfg_moves[0].removed_site, 4);
+        assert_eq!(plan.cfg_moves[0].added_sites, [2]);
+        assert_eq!(plan.cfg_added_sites, [2]);
+        assert_eq!(plan.cfg_removed_sites, [4]);
+        assert_eq!(plan.baseline_added_sites, [2]);
+        assert_eq!(plan.baseline_removed_sites, [4]);
     }
 
     #[test]

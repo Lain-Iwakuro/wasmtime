@@ -19,7 +19,8 @@
 
 use super::ssbb::{SsbbPlan, SsbbSeq};
 use super::v4_fences::{
-    self, V4Block, V4Context, V4Edge, V4Event, V4EventId, V4Graph, V4Node, V4Plan, V4Policy, V4Seq,
+    self, V4Baseline, V4Block, V4Context, V4Edge, V4Event, V4EventId, V4Graph, V4Node, V4Plan,
+    V4Policy, V4Seq,
 };
 use crate::CodegenError;
 use crate::CodegenResult;
@@ -641,12 +642,14 @@ const NO_INST_OFFSET: CodeOffset = u32::MAX;
 struct V4InstructionRecord {
     site: usize,
     effects: V4Seq,
+    legacy: SsbbSeq,
     instruction: String,
 }
 
 struct V4EmissionPlan {
     graph: V4Graph,
     plan: V4Plan,
+    baseline: V4Baseline,
     prologue: Vec<V4InstructionRecord>,
     prologue_exit: usize,
     blocks: Vec<Vec<V4InstructionRecord>>,
@@ -979,7 +982,8 @@ impl<I: VCodeInst> VCode<I> {
                    block: &mut V4Block,
                    records: &mut Vec<V4InstructionRecord>,
                    sites: &mut usize,
-                   block_id: u32| {
+                   block_id: u32|
+         -> CodegenResult<()> {
             if effects.events.is_empty() {
                 effects.events.push(V4Event::Pure);
             }
@@ -1000,8 +1004,10 @@ impl<I: VCodeInst> VCode<I> {
             records.push(V4InstructionRecord {
                 site,
                 effects,
+                legacy: inst.ssbb_seq(&frame, flags, &self.emit_info)?,
                 instruction: format!("{inst:?}"),
             });
+            Ok(())
         };
 
         for inst in self.abi.gen_prologue() {
@@ -1013,7 +1019,7 @@ impl<I: VCodeInst> VCode<I> {
                 &mut prologue,
                 &mut sites,
                 n as u32,
-            );
+            )?;
         }
         let prologue_exit = sites;
         sites += 1;
@@ -1062,7 +1068,7 @@ impl<I: VCodeInst> VCode<I> {
                         &mut instructions,
                         &mut sites,
                         block_index as u32,
-                    );
+                    )?;
                 }
                 for item in regalloc.block_insts_and_edits(self, block_id) {
                     let mut generated = SmallVec::<[I; 4]>::new();
@@ -1152,7 +1158,7 @@ impl<I: VCodeInst> VCode<I> {
                             &mut instructions,
                             &mut sites,
                             block_index as u32,
-                        );
+                        )?;
                     }
                 }
                 let successors = self.block_succs(block_id);
@@ -1190,7 +1196,51 @@ impl<I: VCodeInst> VCode<I> {
             sites,
         };
         v4_fences::assign_loop_depths(&mut graph);
-        let plan = v4_fences::plan(&graph, policy)?;
+        // Replay the unchanged historical dataflow and original per-instruction
+        // effects, independently of the rich selective graph and its guards.
+        let historical = self.compute_ssbb_plan(regalloc, flags)?;
+        let mut baseline = V4Baseline {
+            fences: vec![false; graph.sites],
+            fixed_internal_fences: 0,
+        };
+        let mut replay =
+            |instructions: &[V4InstructionRecord], mut dirty: bool| -> CodegenResult<u32> {
+                let mut guards = 0;
+                for record in instructions {
+                    let entry = v4_fences::replay_legacy_instruction(
+                        &record.legacy,
+                        &record.effects,
+                        &mut dirty,
+                    )
+                    .map_err(|error| {
+                        CodegenError::Unsupported(format!(
+                            "Spectre-v4 legacy replay at site {} instruction {}: {error}",
+                            record.site, record.instruction
+                        ))
+                    })?;
+                    baseline.fences[record.site] = entry;
+                    let fixed = record.effects.fixed_barriers();
+                    baseline.fixed_internal_fences += fixed as usize;
+                    guards += fixed + u32::from(entry);
+                }
+                Ok(guards * I::ssbb_barrier_size())
+            };
+        let prologue_bytes = replay(&prologue, true)?;
+        for (block, instructions) in records.iter().enumerate() {
+            let bytes = replay(instructions, historical.block_in[block])?
+                + if block == self.entry.index() {
+                    prologue_bytes
+                } else {
+                    0
+                };
+            if bytes != historical.extra_bytes[block] {
+                return Err(CodegenError::Unsupported(format!(
+                    "Spectre-v4 actual legacy replay count mismatch in block {block}: replay={bytes}, historical={}",
+                    historical.extra_bytes[block]
+                )));
+            }
+        }
+        let plan = v4_fences::plan_with_baseline(&graph, policy, &baseline)?;
         let mut extra_bytes = vec![0u32; n];
         for (block_index, records) in records.iter().enumerate() {
             let count: u32 = records
@@ -1208,6 +1258,7 @@ impl<I: VCodeInst> VCode<I> {
         Ok(V4EmissionPlan {
             graph,
             plan,
+            baseline,
             prologue,
             prologue_exit,
             blocks: records,
@@ -1517,7 +1568,7 @@ impl<I: VCodeInst> VCode<I> {
                         && std::env::var("CRANELIFT_V4_FENCE_REPORT").as_deref() == Ok("events")
                     {
                         std::eprintln!(
-                            "V4_EVENT {{\"native_stream_fnv64\":\"{native_digest:016x}\",\"block\":{},\"external_entry\":{},\"site\":{},\"offset\":{},\"fence\":{},\"fixed\":{},\"effects\":{:?}}}",
+                            "V4_EVENT {{\"native_stream_fnv64\":\"{native_digest:016x}\",\"block\":{},\"external_entry\":{},\"site\":{},\"offset\":{},\"fence\":{},\"baseline_fence\":{},\"fixed\":{},\"effects\":{:?}}}",
                             if v4_prologue.get() {
                                 v4_external_id
                             } else {
@@ -1527,6 +1578,7 @@ impl<I: VCodeInst> VCode<I> {
                             record.site,
                             buffer.cur_offset(),
                             emission.plan.fences[record.site],
+                            emission.baseline.fences[record.site],
                             record.effects.fixed_barriers(),
                             format!("{:?}", record.effects.events)
                         );
@@ -2062,13 +2114,57 @@ impl<I: VCodeInst> VCode<I> {
                     frozen,
                     reads,
                     writes,
-                    emission.plan.legacy_fences.saturating_sub(experiment),
+                    emission.plan.baseline_removed_sites.len(),
                 )
             } else {
                 (String::from("[]"), 0, 0, 0, 0, 0)
             };
+            let (
+                baseline_verified,
+                baseline_entry,
+                baseline_internal,
+                cfg_added,
+                cfg_removed,
+                baseline_added,
+                baseline_removed,
+                cfg_moves,
+            ) = if let Some(emission) = &v4_plan {
+                let p = &emission.plan;
+                let moves = p
+                    .cfg_moves
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{{\"removed_site\":{},\"added_sites\":{:?}}}",
+                            m.removed_site, m.added_sites
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (
+                    true,
+                    p.legacy_fences,
+                    emission.baseline.fixed_internal_fences,
+                    format!("{:?}", p.cfg_added_sites),
+                    format!("{:?}", p.cfg_removed_sites),
+                    format!("{:?}", p.baseline_added_sites),
+                    format!("{:?}", p.baseline_removed_sites),
+                    format!("[{moves}]"),
+                )
+            } else {
+                (
+                    false,
+                    0,
+                    0,
+                    String::from("[]"),
+                    String::from("[]"),
+                    String::from("[]"),
+                    String::from("[]"),
+                    String::from("[]"),
+                )
+            };
             std::eprintln!(
-                "V4_REPORT {{\"policy\":{:?},\"rule_version\":{},\"native_stream_fnv64\":\"{native_digest:016x}\",\"old_inserted_fences\":{},\"new_inserted_fences\":{},\"new_fences\":{},\"experiment_fences\":{},\"frozen_fences\":{},\"upstream_fences\":{},\"veneer_fences\":{},\"solves\":{},\"fallback\":{},\"moves\":{},\"events\":{},\"frame_accesses\":{},\"local_accesses\":{},\"unknown_accesses\":{},\"unknown_reasons\":{},\"opaque_calls\":{},\"frozen_instructions\":{},\"unknown_reads\":{},\"unknown_writes\":{},\"removed_guards\":{},\"code_bytes\":{},\"emit_ns\":{}}}",
+                "V4_REPORT {{\"policy\":{:?},\"rule_version\":{},\"native_stream_fnv64\":\"{native_digest:016x}\",\"old_inserted_fences\":{},\"new_inserted_fences\":{},\"new_fences\":{},\"experiment_fences\":{},\"frozen_fences\":{},\"upstream_fences\":{},\"veneer_fences\":{},\"solves\":{},\"fallback\":{},\"moves\":{},\"events\":{},\"frame_accesses\":{},\"local_accesses\":{},\"unknown_accesses\":{},\"unknown_reasons\":{},\"opaque_calls\":{},\"frozen_instructions\":{},\"unknown_reads\":{},\"unknown_writes\":{},\"removed_guards\":{},\"baseline_verified\":{},\"baseline_entry_fences\":{},\"baseline_internal_fences\":{},\"entry_fences\":{},\"cfg_added_sites\":{},\"cfg_removed_sites\":{},\"baseline_added_sites\":{},\"baseline_removed_sites\":{},\"cfg_moves\":{},\"code_bytes\":{},\"emit_ns\":{}}}",
                 flags.v4_fence_policy().to_string(),
                 flags.v4_fence_rule_version(),
                 historical_fences.unwrap_or(0),
@@ -2091,6 +2187,15 @@ impl<I: VCodeInst> VCode<I> {
                 unknown_reads,
                 unknown_writes,
                 removed_guards,
+                baseline_verified,
+                baseline_entry,
+                baseline_internal,
+                experiment,
+                cfg_added,
+                cfg_removed,
+                baseline_added,
+                baseline_removed,
+                cfg_moves,
                 finished.data().len(),
                 v4_started.elapsed().as_nanos()
             );

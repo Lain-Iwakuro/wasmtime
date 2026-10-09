@@ -27,13 +27,13 @@ pub(crate) fn classify_v4(
         return external_v4(inst, frame, context);
     }
 
-    // These expand to multiple access points, or contain linker-recognized
-    // templates. Keep their native legacy guards frozen and summarize unknown
-    // addresses; no range exemption is applied inside an expansion.
+    // The outer plan protects the first access. Freeze only guards required
+    // inside an expansion, such as call -> stack return load or a retry edge.
+    // Linker templates and complex expansions retain unknown address summaries.
     let mut seq = match inst {
-        Inst::CallKnown { .. }
-        | Inst::CallUnknown { .. }
-        | Inst::ReturnCallKnown { .. }
+        Inst::CallKnown { info: call } => call_v4(call, frame, info, !call.patchable)?,
+        Inst::CallUnknown { info: call } => call_v4(call, frame, info, true)?,
+        Inst::ReturnCallKnown { .. }
         | Inst::ReturnCallUnknown { .. }
         | Inst::AtomicRmwSeq { .. }
         | Inst::Atomic128RmwSeq { .. }
@@ -84,6 +84,16 @@ pub(crate) fn classify_v4(
         | Inst::LoadExtName { .. } => V4Seq::neutral(),
         Inst::External { .. } => unreachable!(),
     };
+    if let Inst::CallUnknown { info: call } = inst {
+        if let RegMem::Mem { addr } = &call.dest {
+            // The target is fetched by the CALL instruction before entering
+            // its opaque callee; it is a real eight-byte native load.
+            let address: asm::Amode<Gpr> = addr.clone().into();
+            seq.events
+                .insert(0, V4Event::Load(address_range(&address, frame, context, 8)));
+            seq.exn_cut = seq.exn_cut.map(|cut| cut + 1);
+        }
+    }
     if matches!(
         inst,
         Inst::AtomicRmwSeq { .. } | Inst::Atomic128RmwSeq { .. } | Inst::Atomic128XchgSeq { .. }
@@ -433,6 +443,24 @@ fn call_defs<T>(info: &CallInfo<T>, defs: &mut SmallVec<[Reg; 16]>) {
             RetLocation::Reg(reg, ..) => defs.push(reg),
             RetLocation::Stack(..) => defs.push(result.vreg.to_reg()),
         }
+    }
+}
+
+fn call_v4<T>(
+    call: &CallInfo<T>,
+    frame: &FrameLayout,
+    info: &EmitInfo,
+    load_returns: bool,
+) -> CodegenResult<V4Seq> {
+    let legacy = call_seq(call, frame, info, load_returns)?;
+    if legacy.needs_internal() {
+        Ok(V4Seq::frozen_legacy(&legacy))
+    } else {
+        Ok(V4Seq {
+            events: smallvec![V4Event::OpaqueCall],
+            exn_cut: call.try_call_info.as_ref().map(|_| 0),
+            ..V4Seq::neutral()
+        })
     }
 }
 

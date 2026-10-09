@@ -102,7 +102,8 @@ pub(crate) fn classify_v4(
         Inst::StackProbeLoop { .. } => seq.events.push(V4Event::Store(V4Range::Unknown)),
         Inst::Ssbb { .. } => seq.events.push(V4Event::Barrier(V4BarrierOrigin::Upstream)),
         // Keep address-materialization/literal/table/TLS/tail templates together.
-        // Their first guard is forced inside the expansion in selective mode.
+        // The shared plan protects their first read; only guards for transitions
+        // within the expansion are fixed as legacy-internal barriers.
         Inst::JTSequence { .. }
         | Inst::LoadExtNameGot { .. }
         | Inst::LoadExtNameFar { .. }
