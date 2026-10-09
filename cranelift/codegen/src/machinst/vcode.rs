@@ -18,6 +18,9 @@
 //! backend pipeline.
 
 use super::ssbb::{SsbbPlan, SsbbSeq};
+use super::v4_fences::{
+    self, V4Block, V4Context, V4Edge, V4Event, V4EventId, V4Graph, V4Node, V4Plan, V4Policy, V4Seq,
+};
 use crate::CodegenError;
 use crate::CodegenResult;
 use crate::FxHashMap;
@@ -29,7 +32,7 @@ use crate::timing;
 use crate::trace;
 use crate::{LabelValueLoc, ValueLocRange};
 use crate::{machinst::*, trace_log_enabled};
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use regalloc2::{
     Edit, Function as RegallocFunction, InstOrEdit, InstPosition, InstRange, Operand,
     OperandConstraint, OperandKind, PRegSet, ProgPoint, RegClass,
@@ -635,6 +638,21 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 
 const NO_INST_OFFSET: CodeOffset = u32::MAX;
 
+struct V4InstructionRecord {
+    site: usize,
+    effects: V4Seq,
+    instruction: String,
+}
+
+struct V4EmissionPlan {
+    graph: V4Graph,
+    plan: V4Plan,
+    prologue: Vec<V4InstructionRecord>,
+    prologue_exit: usize,
+    blocks: Vec<Vec<V4InstructionRecord>>,
+    extra_bytes: Vec<u32>,
+}
+
 impl<I: VCodeInst> VCode<I> {
     /// New empty VCode.
     fn new(
@@ -920,6 +938,364 @@ impl<I: VCodeInst> VCode<I> {
         })
     }
 
+    fn compute_v4_plan(
+        &mut self,
+        regalloc: &regalloc2::Output,
+        flags: &settings::Flags,
+        policy: V4Policy,
+    ) -> CodegenResult<V4EmissionPlan> {
+        let n = self.num_blocks();
+        let frame = self.abi.frame_layout().clone();
+        let mut sites = 0;
+        let mut prologue_context = V4Context::new(n as u32, policy);
+        prologue_context.external_entry = true;
+        // Initialize ABI entry facts even for a frameless empty prologue. The
+        // pure marker is never added to the native stream or emitted. Four
+        // bytes meet both the x64 and AArch64 NOP constructor contracts.
+        let initialization =
+            I::gen_nop(4).v4_seq(&frame, flags, &self.emit_info, &mut prologue_context)?;
+        if initialization
+            .events
+            .iter()
+            .any(|event| *event != V4Event::Pure)
+        {
+            return Err(CodegenError::Unsupported(String::from(
+                "Spectre-v4 entry initialization has non-pure effects",
+            )));
+        }
+        let mut prologue = Vec::new();
+        let mut external = V4Block {
+            events: Vec::new(),
+            successors: vec![V4Edge {
+                target: self.entry.index(),
+                cut: None,
+            }],
+            exit_site: None,
+            loop_depth: 0,
+        };
+
+        let add = |inst: &I,
+                   mut effects: V4Seq,
+                   block: &mut V4Block,
+                   records: &mut Vec<V4InstructionRecord>,
+                   sites: &mut usize,
+                   block_id: u32| {
+            if effects.events.is_empty() {
+                effects.events.push(V4Event::Pure);
+            }
+            let site = *sites;
+            *sites += 1;
+            let instruction_id = records.len() as u32;
+            for (sub, event) in effects.events.iter().copied().enumerate() {
+                block.events.push(V4Node {
+                    id: V4EventId {
+                        block: block_id,
+                        inst: instruction_id,
+                        sub: sub as u16,
+                    },
+                    event,
+                    guard: Some(site),
+                });
+            }
+            records.push(V4InstructionRecord {
+                site,
+                effects,
+                instruction: format!("{inst:?}"),
+            });
+        };
+
+        for inst in self.abi.gen_prologue() {
+            let effects = inst.v4_seq(&frame, flags, &self.emit_info, &mut prologue_context)?;
+            add(
+                &inst,
+                effects,
+                &mut external,
+                &mut prologue,
+                &mut sites,
+                n as u32,
+            );
+        }
+        let prologue_exit = sites;
+        sites += 1;
+        external.events.push(V4Node {
+            id: V4EventId {
+                block: n as u32,
+                inst: prologue.len() as u32,
+                sub: 0,
+            },
+            event: V4Event::Pure,
+            guard: Some(prologue_exit),
+        });
+        external.exit_site = Some(prologue_exit);
+        prologue_context.external_entry = false;
+        let body_sites = sites;
+        // Every block begins with canonical ABI facts, never the preceding
+        // layout block's epilogue. Any contradictory outgoing frame relation
+        // invalidates that register globally and forces recollection.
+        let (mut blocks, records) = loop {
+            sites = body_sites;
+            let mut blocks = Vec::with_capacity(n + 1);
+            let mut records = Vec::with_capacity(n);
+            let mut invalid = Vec::new();
+            for block_index in 0..n {
+                let block_id = BlockIndex::new(block_index);
+                let mut block = V4Block {
+                    events: Vec::new(),
+                    successors: Vec::new(),
+                    exit_site: None,
+                    loop_depth: 0,
+                };
+                let mut instructions = Vec::new();
+                let mut context = prologue_context.clone();
+                context.start_block(block_index as u32);
+                let mut exn_cut = None;
+                if let Some(inst) = I::gen_block_start(
+                    self.block_order.is_indirect_branch_target(block_id),
+                    self.abi.is_forward_edge_cfi_enabled(),
+                ) {
+                    let effects = inst.v4_seq(&frame, flags, &self.emit_info, &mut context)?;
+                    add(
+                        &inst,
+                        effects,
+                        &mut block,
+                        &mut instructions,
+                        &mut sites,
+                        block_index as u32,
+                    );
+                }
+                for item in regalloc.block_insts_and_edits(self, block_id) {
+                    let mut generated = SmallVec::<[I; 4]>::new();
+                    let mut original = None;
+                    match item {
+                        InstOrEdit::Inst(index) => {
+                            if self.insts[index.index()].is_term() == MachTerminator::Ret {
+                                generated.extend(self.abi.gen_epilogue());
+                            } else {
+                                let mut inst = self.insts[index.index()].clone();
+                                Self::rewrite_allocs(&mut inst, index, regalloc);
+                                generated.push(inst);
+                                original = Some(index);
+                            }
+                        }
+                        InstOrEdit::Edit(Edit::Move { from, to }) => {
+                            generated.push(match (from.as_reg(), to.as_reg()) {
+                                (Some(from), Some(to)) => I::gen_move(
+                                    Writable::from_reg(Reg::from(to)),
+                                    Reg::from(from),
+                                    I::canonical_type_for_rc(from.class()),
+                                ),
+                                (Some(from), None) => self
+                                    .abi
+                                    .gen_spill(to.as_stack().unwrap(), RealReg::from(from)),
+                                (None, Some(to)) => self.abi.gen_reload(
+                                    Writable::from_reg(RealReg::from(to)),
+                                    from.as_stack().unwrap(),
+                                ),
+                                _ => unreachable!("regalloc stack-to-stack move"),
+                            });
+                        }
+                    }
+                    for inst in generated {
+                        let mut effects =
+                            inst.v4_seq(&frame, flags, &self.emit_info, &mut context)?;
+                        // Native operands no longer expose physical Def operands;
+                        // retain their original allocation facts as a second audit.
+                        if let Some(index) = original {
+                            let range = self.operand_ranges.get(index.index());
+                            let mut defs: Vec<Reg> = self.operands[range.clone()]
+                                .iter()
+                                .zip(regalloc.inst_allocs(index))
+                                .filter_map(|(operand, allocation)| {
+                                    (operand.kind() == OperandKind::Def)
+                                        .then(|| allocation.as_reg().map(Reg::from))
+                                        .flatten()
+                                })
+                                .collect();
+                            if let Some(clobbers) = self.clobbers.get(&index) {
+                                defs.extend(clobbers.into_iter().map(Reg::from));
+                            }
+                            for reg in defs {
+                                if !effects.events.contains(&V4Event::RegisterDef(reg)) {
+                                    effects.events.push(V4Event::RegisterDef(reg));
+                                    context.def(reg);
+                                }
+                            }
+                        }
+                        if let Some(cut) = effects.exn_cut {
+                            if exn_cut.is_some() {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "Spectre-v4 multiple exception cuts in block {block_index}"
+                                )));
+                            }
+                            exn_cut = Some(block.events.len() + cut);
+                        }
+                        let pure_branch = inst.is_term() == MachTerminator::Branch
+                            && effects.events.iter().all(|event| *event == V4Event::Pure);
+                        if pure_branch {
+                            block.exit_site = Some(sites);
+                        } else {
+                            block.exit_site = None;
+                        }
+                        add(
+                            &inst,
+                            effects,
+                            &mut block,
+                            &mut instructions,
+                            &mut sites,
+                            block_index as u32,
+                        );
+                    }
+                }
+                let successors = self.block_succs(block_id);
+                for (i, target) in successors.iter().enumerate() {
+                    block.successors.push(V4Edge {
+                        target: target.index(),
+                        cut: if i + 1 == successors.len() {
+                            None
+                        } else {
+                            exn_cut
+                        },
+                    });
+                }
+                if !successors.is_empty() {
+                    for &(reg, offset) in prologue_context.frame_facts() {
+                        if context.frame_offset(reg) != Some(offset) && !invalid.contains(&reg) {
+                            invalid.push(reg);
+                        }
+                    }
+                }
+                blocks.push(block);
+                records.push(instructions);
+            }
+            if invalid.is_empty() {
+                break (blocks, records);
+            }
+            for reg in invalid {
+                prologue_context.set_frame_offset(reg, None);
+            }
+        };
+        blocks.push(external);
+        let mut graph = V4Graph {
+            blocks,
+            entry: n,
+            sites,
+        };
+        v4_fences::assign_loop_depths(&mut graph);
+        let plan = v4_fences::plan(&graph, policy)?;
+        let mut extra_bytes = vec![0u32; n];
+        for (block_index, records) in records.iter().enumerate() {
+            let count: u32 = records
+                .iter()
+                .map(|record| record.effects.fixed_barriers() + u32::from(plan.fences[record.site]))
+                .sum();
+            extra_bytes[block_index] = count * I::ssbb_barrier_size();
+        }
+        extra_bytes[self.entry.index()] += (prologue
+            .iter()
+            .map(|r| r.effects.fixed_barriers() + u32::from(plan.fences[r.site]))
+            .sum::<u32>()
+            + u32::from(plan.fences[prologue_exit]))
+            * I::ssbb_barrier_size();
+        Ok(V4EmissionPlan {
+            graph,
+            plan,
+            prologue,
+            prologue_exit,
+            blocks: records,
+            extra_bytes,
+        })
+    }
+
+    fn native_stream_digest(
+        &mut self,
+        regalloc: &regalloc2::Output,
+        flags: &settings::Flags,
+    ) -> (u64, u32) {
+        fn feed(digest: &mut u64, bytes: &[u8]) {
+            for byte in bytes {
+                *digest ^= u64::from(*byte);
+                *digest = digest.wrapping_mul(0x100000001b3);
+            }
+            *digest ^= 0xff;
+            *digest = digest.wrapping_mul(0x100000001b3);
+        }
+        let mut digest = 0xcbf29ce484222325;
+        let mut upstream = 0;
+        let frame = self.abi.frame_layout().clone();
+        let count_upstream = |inst: &I, upstream: &mut u32| {
+            if let Ok(sequence) = inst.ssbb_seq(&frame, flags, &self.emit_info) {
+                *upstream += sequence
+                    .steps
+                    .iter()
+                    .filter(|step| matches!(step, super::ssbb::SsbbMemStep::Clear))
+                    .count() as u32;
+            }
+        };
+        feed(
+            &mut digest,
+            format!("{:?}", self.abi.frame_layout()).as_bytes(),
+        );
+        for inst in self.abi.gen_prologue() {
+            count_upstream(&inst, &mut upstream);
+            feed(&mut digest, format!("prologue:{inst:?}").as_bytes());
+        }
+        for block_index in 0..self.num_blocks() {
+            let block = BlockIndex::new(block_index);
+            feed(
+                &mut digest,
+                format!(
+                    "block:{block_index}:successors:{:?}",
+                    self.block_succs(block)
+                )
+                .as_bytes(),
+            );
+            if let Some(inst) = I::gen_block_start(
+                self.block_order.is_indirect_branch_target(block),
+                self.abi.is_forward_edge_cfi_enabled(),
+            ) {
+                count_upstream(&inst, &mut upstream);
+                feed(&mut digest, format!("{inst:?}").as_bytes());
+            }
+            for item in regalloc.block_insts_and_edits(self, block) {
+                match item {
+                    InstOrEdit::Inst(index) => {
+                        if self.insts[index.index()].is_term() == MachTerminator::Ret {
+                            for inst in self.abi.gen_epilogue() {
+                                count_upstream(&inst, &mut upstream);
+                                feed(&mut digest, format!("{inst:?}").as_bytes());
+                            }
+                        } else {
+                            let mut inst = self.insts[index.index()].clone();
+                            Self::rewrite_allocs(&mut inst, index, regalloc);
+                            count_upstream(&inst, &mut upstream);
+                            feed(&mut digest, format!("{inst:?}").as_bytes());
+                        }
+                    }
+                    InstOrEdit::Edit(Edit::Move { from, to }) => {
+                        let inst = match (from.as_reg(), to.as_reg()) {
+                            (Some(from), Some(to)) => I::gen_move(
+                                Writable::from_reg(Reg::from(to)),
+                                Reg::from(from),
+                                I::canonical_type_for_rc(from.class()),
+                            ),
+                            (Some(from), None) => self
+                                .abi
+                                .gen_spill(to.as_stack().unwrap(), RealReg::from(from)),
+                            (None, Some(to)) => self.abi.gen_reload(
+                                Writable::from_reg(RealReg::from(to)),
+                                from.as_stack().unwrap(),
+                            ),
+                            _ => unreachable!(),
+                        };
+                        count_upstream(&inst, &mut upstream);
+                        feed(&mut digest, format!("{inst:?}").as_bytes());
+                    }
+                }
+            }
+        }
+        (digest, upstream)
+    }
+
     /// Emit the instructions to a `MachBuffer`, containing fixed-up
     /// code and external reloc/trap/etc. records ready for use. Takes
     /// the regalloc results as well.
@@ -938,6 +1314,8 @@ impl<I: VCodeInst> VCode<I> {
         I: VCodeInst,
     {
         let _tt = timing::vcode_emit();
+        #[cfg(feature = "std")]
+        let v4_started = std::time::Instant::now();
         let mut buffer = MachBuffer::new();
         buffer.set_log2_min_function_alignment(self.log2_min_function_alignment);
         let mut bb_starts: Vec<Option<CodeOffset>> = vec![];
@@ -985,7 +1363,47 @@ impl<I: VCodeInst> VCode<I> {
         let mut inst_offsets = vec![];
         let mut state = I::State::new(&self.abi, core::mem::take(ctrl_plane));
         let ssbb_on = I::ssbb_enabled(&self.emit_info);
-        let ssbb_plan = if ssbb_on {
+        #[cfg(feature = "std")]
+        let report_enabled = std::env::var_os("CRANELIFT_V4_FENCE_REPORT").is_some();
+        #[cfg(not(feature = "std"))]
+        let report_enabled = false;
+        let (native_digest, original_upstream) = if report_enabled {
+            self.native_stream_digest(regalloc, flags)
+        } else {
+            (0, 0)
+        };
+        let historical_fences = if report_enabled && ssbb_on {
+            Some(
+                self.compute_ssbb_plan(regalloc, flags)?
+                    .extra_bytes
+                    .iter()
+                    .sum::<u32>()
+                    / I::ssbb_barrier_size(),
+            )
+        } else {
+            None
+        };
+        let policy = match flags.v4_fence_policy() {
+            settings::V4FencePolicy::Legacy => None,
+            settings::V4FencePolicy::Frame => Some(V4Policy::Frame),
+            settings::V4FencePolicy::Ranges => Some(V4Policy::Ranges),
+            settings::V4FencePolicy::RangesCfg => Some(V4Policy::RangesCfg),
+        };
+        if policy.is_some() && !ssbb_on {
+            return Err(CodegenError::Unsupported(String::from(
+                "selective v4_fence_policy requires an enabled supported software barrier",
+            )));
+        }
+        if flags.v4_fence_rule_version() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "unsupported Spectre-v4 analysis rule version {}",
+                flags.v4_fence_rule_version()
+            )));
+        }
+        let v4_plan = policy
+            .map(|policy| self.compute_v4_plan(regalloc, flags, policy))
+            .transpose()?;
+        let ssbb_plan = if ssbb_on && policy.is_none() {
             let plan = self.compute_ssbb_plan(regalloc, flags)?;
             buffer.set_veneer_load_barrier(I::ssbb_veneer_barrier());
             state.ssbb_install(&plan.block_in);
@@ -993,6 +1411,11 @@ impl<I: VCodeInst> VCode<I> {
         } else {
             None
         };
+        if v4_plan.is_some() {
+            buffer.set_veneer_load_barrier(I::ssbb_veneer_barrier());
+            state.ssbb_install(&vec![false; self.num_blocks()]);
+            state.v4_set_selective(true);
+        }
 
         let mut disasm = String::new();
 
@@ -1038,11 +1461,66 @@ impl<I: VCodeInst> VCode<I> {
             }
             assert_eq!(buffer.cur_offset(), new_offset);
 
+            let v4_cursor = core::cell::Cell::new(0usize);
+            let v4_prologue = core::cell::Cell::new(block == self.entry);
+            let v4_external_id = self.num_blocks();
             let do_emit = |inst: &I,
                            disasm: &mut String,
                            buffer: &mut MachBuffer<I>,
-                           state: &mut I::State| {
-                if ssbb_on && !I::ssbb_handles_emission() {
+                           state: &mut I::State|
+             -> CodegenResult<()> {
+                let mut expected_barriers = None;
+                if let Some(emission) = &v4_plan {
+                    let records = if v4_prologue.get() {
+                        &emission.prologue
+                    } else {
+                        &emission.blocks[block.index()]
+                    };
+                    let record = records.get(v4_cursor.get()).ok_or_else(|| CodegenError::Unsupported(format!("Spectre-v4 emission has unclassified instruction in block {}: {inst:?}", block.index())))?;
+                    if record.instruction != format!("{inst:?}") {
+                        return Err(CodegenError::Unsupported(format!(
+                            "Spectre-v4 frozen instruction changed in block {} at site {}: expected {}, emitted {inst:?}",
+                            block.index(),
+                            record.site,
+                            record.instruction
+                        )));
+                    }
+                    v4_cursor.set(v4_cursor.get() + 1);
+                    let before = state.ssbb_barrier_count();
+                    if emission.plan.fences[record.site] {
+                        if want_disasm {
+                            writeln!(disasm, "  {}", I::ssbb_mnemonic()).unwrap();
+                        }
+                        state.ssbb_emit_barrier(buffer, &self.emit_info);
+                    }
+                    state.v4_set_legacy_internal(record.effects.legacy_internal);
+                    expected_barriers = Some((
+                        before,
+                        record.effects.fixed_barriers()
+                            + u32::from(emission.plan.fences[record.site]),
+                        record.site,
+                    ));
+                    #[cfg(feature = "std")]
+                    if report_enabled
+                        && std::env::var("CRANELIFT_V4_FENCE_REPORT").as_deref() == Ok("events")
+                    {
+                        std::eprintln!(
+                            "V4_EVENT {{\"native_stream_fnv64\":\"{native_digest:016x}\",\"block\":{},\"external_entry\":{},\"site\":{},\"offset\":{},\"fence\":{},\"fixed\":{},\"effects\":{:?}}}",
+                            if v4_prologue.get() {
+                                v4_external_id
+                            } else {
+                                block.index()
+                            },
+                            v4_prologue.get(),
+                            record.site,
+                            buffer.cur_offset(),
+                            emission.plan.fences[record.site],
+                            record.effects.fixed_barriers(),
+                            format!("{:?}", record.effects.events)
+                        );
+                    }
+                }
+                if ssbb_on && policy.is_none() && !I::ssbb_handles_emission() {
                     let seq = inst
                         .ssbb_seq(state.frame_layout(), flags, &self.emit_info)
                         .expect("ssbb classification changed between the fixed-point and emission");
@@ -1066,6 +1544,17 @@ impl<I: VCodeInst> VCode<I> {
                     writeln!(disasm, "  {}", inst.pretty_print_inst(&mut s)).unwrap();
                 }
                 inst.emit(buffer, &self.emit_info, state);
+                if let Some((before, expected, site)) = expected_barriers {
+                    let actual = state.ssbb_barrier_count() - before;
+                    if actual != expected {
+                        return Err(CodegenError::Unsupported(format!(
+                            "Spectre-v4 barrier emission drift at site {site}, block {}: expected {expected}, emitted {actual}, instruction {inst:?}",
+                            block.index()
+                        )));
+                    }
+                    state.v4_set_legacy_internal(false);
+                }
+                Ok(())
             };
 
             if ssbb_on {
@@ -1081,12 +1570,25 @@ impl<I: VCodeInst> VCode<I> {
                 }
                 buffer.start_srcloc(Default::default());
                 for inst in &self.abi.gen_prologue() {
-                    do_emit(&inst, &mut disasm, &mut buffer, &mut state);
+                    do_emit(&inst, &mut disasm, &mut buffer, &mut state)?;
+                }
+                if let Some(emission) = &v4_plan {
+                    if v4_cursor.get() != emission.prologue.len() {
+                        return Err(CodegenError::Unsupported(String::from(
+                            "Spectre-v4 prologue emission omitted classified instructions",
+                        )));
+                    }
+                    if emission.plan.fences[emission.prologue_exit] {
+                        state.ssbb_emit_barrier(&mut buffer, &self.emit_info);
+                    }
                 }
                 buffer.end_srcloc();
             }
 
-            if ssbb_on {
+            v4_prologue.set(false);
+            v4_cursor.set(0);
+
+            if ssbb_plan.is_some() {
                 state.ssbb_set_dirty(ssbb_plan.as_ref().unwrap().block_in[block.index()]);
             }
 
@@ -1118,7 +1620,7 @@ impl<I: VCodeInst> VCode<I> {
                 self.block_order.is_indirect_branch_target(block),
                 is_forward_edge_cfi_enabled,
             ) {
-                do_emit(&block_start, &mut disasm, &mut buffer, &mut state);
+                do_emit(&block_start, &mut disasm, &mut buffer, &mut state)?;
             }
 
             for inst_or_edit in regalloc.block_insts_and_edits(&self, block) {
@@ -1224,7 +1726,7 @@ impl<I: VCodeInst> VCode<I> {
                         if self.insts[iix.index()].is_term() == MachTerminator::Ret {
                             log::trace!("emitting epilogue");
                             for inst in self.abi.gen_epilogue() {
-                                do_emit(&inst, &mut disasm, &mut buffer, &mut state);
+                                do_emit(&inst, &mut disasm, &mut buffer, &mut state)?;
                             }
                         } else {
                             // Update the operands for this inst using the
@@ -1257,7 +1759,7 @@ impl<I: VCodeInst> VCode<I> {
                                 &mut disasm,
                                 &mut buffer,
                                 &mut state,
-                            );
+                            )?;
 
                             if debug_tag_pos == MachDebugTagPos::Post {
                                 place_debug_tags(&self, debug_tag_pos, &mut buffer);
@@ -1285,21 +1787,21 @@ impl<I: VCodeInst> VCode<I> {
                                 debug_assert_eq!(from.class(), to.class());
                                 let ty = I::canonical_type_for_rc(from.class());
                                 let mv = I::gen_move(to_rreg, from_rreg, ty);
-                                do_emit(&mv, &mut disasm, &mut buffer, &mut state);
+                                do_emit(&mv, &mut disasm, &mut buffer, &mut state)?;
                             }
                             (Some(from), None) => {
                                 // Spill from register to spillslot.
                                 let to = to.as_stack().unwrap();
                                 let from_rreg = RealReg::from(from);
                                 let spill = self.abi.gen_spill(to, from_rreg);
-                                do_emit(&spill, &mut disasm, &mut buffer, &mut state);
+                                do_emit(&spill, &mut disasm, &mut buffer, &mut state)?;
                             }
                             (None, Some(to)) => {
                                 // Load from spillslot to register.
                                 let from = from.as_stack().unwrap();
                                 let to_rreg = Writable::from_reg(RealReg::from(to));
                                 let reload = self.abi.gen_reload(to_rreg, from);
-                                do_emit(&reload, &mut disasm, &mut buffer, &mut state);
+                                do_emit(&reload, &mut disasm, &mut buffer, &mut state)?;
                             }
                             (None, None) => {
                                 panic!("regalloc2 should have eliminated stack-to-stack moves!");
@@ -1322,6 +1824,22 @@ impl<I: VCodeInst> VCode<I> {
                     block.index()
                 );
             }
+            if let Some(emission) = &v4_plan {
+                if v4_cursor.get() != emission.blocks[block.index()].len() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "Spectre-v4 block {} omitted classified instructions",
+                        block.index()
+                    )));
+                }
+                if state.ssbb_barrier_count() * I::ssbb_barrier_size()
+                    != emission.extra_bytes[block.index()]
+                {
+                    return Err(CodegenError::Unsupported(format!(
+                        "Spectre-v4 block {} total barrier count changed",
+                        block.index()
+                    )));
+                }
+            }
 
             // Do we need an island? Get the worst-case size of the next BB, add
             // it to the optional padding behind the block, and pass this to the
@@ -1336,7 +1854,11 @@ impl<I: VCodeInst> VCode<I> {
                 let ssbb_extra = ssbb_plan
                     .as_ref()
                     .map(|plan| plan.extra_bytes[next_block.index()])
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    + v4_plan
+                        .as_ref()
+                        .map(|plan| plan.extra_bytes[next_block.index()])
+                        .unwrap_or(0);
                 I::worst_case_size() * (next_block_size + next_block_ra_insertions) + ssbb_extra
             } else {
                 0
@@ -1411,8 +1933,165 @@ impl<I: VCodeInst> VCode<I> {
         // Store metadata about frame layout in the MachBuffer.
         buffer.set_frame_layout(self.abi.frame_slot_metadata());
 
+        let (finished, veneer_fences) = buffer.finish_with_v4_count(&self.constants, ctrl_plane);
+        #[cfg(feature = "std")]
+        if report_enabled {
+            let (
+                experiment,
+                fixed,
+                upstream,
+                solves,
+                fallback,
+                moves,
+                event_count,
+                frame_accesses,
+                local_accesses,
+                unknown_accesses,
+            ) = if let Some(emission) = &v4_plan {
+                let mut fixed = 0;
+                let mut upstream = 0;
+                let mut frame = 0;
+                let mut local = 0;
+                let mut unknown = 0;
+                let mut events = 0;
+                for block in &emission.graph.blocks {
+                    for node in &block.events {
+                        events += 1;
+                        match node.event {
+                            V4Event::Barrier(v4_fences::V4BarrierOrigin::LegacyInternal) => {
+                                fixed += 1
+                            }
+                            V4Event::Barrier(v4_fences::V4BarrierOrigin::Upstream) => upstream += 1,
+                            V4Event::Load(range)
+                            | V4Event::Store(range)
+                            | V4Event::Rmw(range, _) => match range {
+                                v4_fences::V4Range::Frame { .. } => frame += 1,
+                                v4_fences::V4Range::LocalBase { .. } => local += 1,
+                                v4_fences::V4Range::Unknown => unknown += 1,
+                            },
+                            V4Event::OpaqueCall => unknown += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                (
+                    emission.plan.fences.iter().filter(|f| **f).count(),
+                    fixed,
+                    upstream,
+                    emission.plan.solve_count,
+                    emission.plan.fallback,
+                    emission.plan.moved,
+                    events,
+                    frame,
+                    local,
+                    unknown,
+                )
+            } else {
+                (
+                    historical_fences.unwrap_or(0) as usize,
+                    0,
+                    original_upstream as usize,
+                    0,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            let fallback_json = fallback
+                .map(|reason| format!("{reason:?}"))
+                .unwrap_or_else(|| String::from("null"));
+            let (
+                reason_json,
+                calls,
+                frozen_instructions,
+                unknown_reads,
+                unknown_writes,
+                removed_guards,
+            ) = if let Some(emission) = &v4_plan {
+                let reason_json = format!(
+                    "[{}]",
+                    emission
+                        .plan
+                        .unknown_reasons
+                        .iter()
+                        .map(|reason| format!("{:?}", format!("{reason:?}")))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                let mut calls = 0;
+                let mut reads = 0;
+                let mut writes = 0;
+                for block in &emission.graph.blocks {
+                    for node in &block.events {
+                        match node.event {
+                            V4Event::OpaqueCall => calls += 1,
+                            V4Event::Load(v4_fences::V4Range::Unknown) => reads += 1,
+                            V4Event::Store(v4_fences::V4Range::Unknown) => writes += 1,
+                            V4Event::Rmw(read, write) => {
+                                reads += usize::from(read == v4_fences::V4Range::Unknown);
+                                writes += usize::from(write == v4_fences::V4Range::Unknown);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let frozen = emission
+                    .prologue
+                    .iter()
+                    .chain(emission.blocks.iter().flatten())
+                    .filter(|record| record.effects.legacy_internal)
+                    .count();
+                (
+                    reason_json,
+                    calls,
+                    frozen,
+                    reads,
+                    writes,
+                    emission.plan.legacy_fences.saturating_sub(experiment),
+                )
+            } else {
+                (String::from("[]"), 0, 0, 0, 0, 0)
+            };
+            std::eprintln!(
+                "V4_REPORT {{\"policy\":{:?},\"rule_version\":{},\"native_stream_fnv64\":\"{native_digest:016x}\",\"old_inserted_fences\":{},\"new_inserted_fences\":{},\"new_fences\":{},\"experiment_fences\":{},\"frozen_fences\":{},\"upstream_fences\":{},\"veneer_fences\":{},\"solves\":{},\"fallback\":{},\"moves\":{},\"events\":{},\"frame_accesses\":{},\"local_accesses\":{},\"unknown_accesses\":{},\"unknown_reasons\":{},\"opaque_calls\":{},\"frozen_instructions\":{},\"unknown_reads\":{},\"unknown_writes\":{},\"removed_guards\":{},\"code_bytes\":{},\"emit_ns\":{}}}",
+                flags.v4_fence_policy().to_string(),
+                flags.v4_fence_rule_version(),
+                historical_fences.unwrap_or(0),
+                experiment + fixed,
+                experiment + fixed + upstream + veneer_fences as usize,
+                experiment,
+                fixed,
+                upstream,
+                veneer_fences,
+                solves,
+                fallback_json,
+                moves,
+                event_count,
+                frame_accesses,
+                local_accesses,
+                unknown_accesses,
+                reason_json,
+                calls,
+                frozen_instructions,
+                unknown_reads,
+                unknown_writes,
+                removed_guards,
+                finished.data().len(),
+                v4_started.elapsed().as_nanos()
+            );
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = (
+            native_digest,
+            original_upstream,
+            historical_fences,
+            veneer_fences,
+        );
         Ok(EmitResult {
-            buffer: buffer.finish(&self.constants, ctrl_plane),
+            buffer: finished,
             bb_offsets,
             bb_edges,
             disasm: if want_disasm { Some(disasm) } else { None },

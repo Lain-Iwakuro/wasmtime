@@ -64,6 +64,14 @@ impl X64Backend {
         domtree: &DominatorTree,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
+        crate::isa::validate_v4_shared(&self.triple, &self.flags)?;
+        if self.flags.v4_fence_policy() != crate::settings::V4FencePolicy::Legacy
+            && self.x64_flags.x64_mitigation() != x64_settings::X64Mitigation::Lfence
+        {
+            return Err(CodegenError::Unsupported(alloc::string::String::from(
+                "selective v4_fence_policy requires x64_mitigation=lfence",
+            )));
+        }
         // This performs lowering to VCode, register-allocates the code, computes
         // block layout and finalizes branches. The result is ready for binary emission.
         let emit_info = EmitInfo::new(self.flags.clone(), self.x64_flags.clone());

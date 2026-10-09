@@ -1605,6 +1605,16 @@ impl MachInstEmit for Inst {
         ssbb::classify(self, frame, info)
     }
 
+    fn v4_seq(
+        &self,
+        frame: &FrameLayout,
+        _flags: &settings::Flags,
+        info: &EmitInfo,
+        context: &mut crate::machinst::v4_fences::V4Context,
+    ) -> CodegenResult<crate::machinst::v4_fences::V4Seq> {
+        ssbb::classify_v4(self, frame, info, context)
+    }
+
     fn ssbb_barrier_size() -> u32 {
         3
     }

@@ -334,6 +334,8 @@ pub struct MachBuffer<I: VCodeInst> {
     frame_layout: Option<MachBufferFrameLayout>,
     /// When set, veneers that load a literal are prefixed with this barrier word.
     veneer_load_barrier: Option<u32>,
+    /// Number of actual late load-bearing veneer guards emitted.
+    v4_veneer_barriers: u32,
 }
 
 impl MachBufferFinalized<Stencil> {
@@ -505,6 +507,7 @@ impl<I: VCodeInst> MachBuffer<I> {
             open_patchable: false,
             frame_layout: None,
             veneer_load_barrier: None,
+            v4_veneer_barriers: 0,
         }
     }
 
@@ -1537,6 +1540,9 @@ impl<I: VCodeInst> MachBuffer<I> {
         } else {
             0
         };
+        if extra == 4 {
+            self.v4_veneer_barriers += 1;
+        }
         let veneer_slice = self.get_appended_space((kind.veneer_size() + extra) as usize);
         let (body, body_offset) = if extra == 4 {
             veneer_slice[..4].copy_from_slice(&barrier.unwrap().to_le_bytes());
@@ -1581,10 +1587,19 @@ impl<I: VCodeInst> MachBuffer<I> {
 
     /// Finish any deferred emissions and/or fixups.
     pub fn finish(
-        mut self,
+        self,
         constants: &VCodeConstants,
         ctrl_plane: &mut ControlPlane,
     ) -> MachBufferFinalized<Stencil> {
+        self.finish_with_v4_count(constants, ctrl_plane).0
+    }
+
+    /// Finalize code and return the actual number of late veneer guards.
+    pub(crate) fn finish_with_v4_count(
+        mut self,
+        constants: &VCodeConstants,
+        ctrl_plane: &mut ControlPlane,
+    ) -> (MachBufferFinalized<Stencil>, u32) {
         let _tt = timing::vcode_emit_finish();
 
         self.finish_emission_maybe_forcing_veneers(ForceVeneers::No, ctrl_plane);
@@ -1619,22 +1634,26 @@ impl<I: VCodeInst> MachBuffer<I> {
         let mut srclocs = self.srclocs;
         srclocs.sort_by_key(|entry| entry.start);
 
-        MachBufferFinalized {
-            data: self.data,
-            relocs: finalized_relocs,
-            traps: self.traps,
-            call_sites: self.call_sites,
-            patchable_call_sites: self.patchable_call_sites,
-            exception_handlers: finalized_exception_handlers,
-            srclocs,
-            debug_tags: self.debug_tags,
-            debug_tag_pool: self.debug_tag_pool,
-            user_stack_maps: self.user_stack_maps,
-            unwind_info: self.unwind_info,
-            alignment,
-            frame_layout: self.frame_layout,
-            nop_units: I::gen_nop_units(),
-        }
+        let veneer_barriers = self.v4_veneer_barriers;
+        (
+            MachBufferFinalized {
+                data: self.data,
+                relocs: finalized_relocs,
+                traps: self.traps,
+                call_sites: self.call_sites,
+                patchable_call_sites: self.patchable_call_sites,
+                exception_handlers: finalized_exception_handlers,
+                srclocs,
+                debug_tags: self.debug_tags,
+                debug_tag_pool: self.debug_tag_pool,
+                user_stack_maps: self.user_stack_maps,
+                unwind_info: self.unwind_info,
+                alignment,
+                frame_layout: self.frame_layout,
+                nop_units: I::gen_nop_units(),
+            },
+            veneer_barriers,
+        )
     }
 
     /// Add an external relocation at the given offset.

@@ -667,6 +667,8 @@ struct SsbbCursor {
     dirty: bool,
     block_in: alloc::vec::Vec<bool>,
     barriers: u32,
+    selective: bool,
+    legacy_internal: bool,
 }
 
 /// State carried between emissions of a sequence of instructions.
@@ -716,6 +718,8 @@ impl MachInstEmitState<Inst> for EmitState {
             dirty: false,
             block_in: block_in.to_vec(),
             barriers: 0,
+            selective: false,
+            legacy_internal: false,
         });
     }
 
@@ -746,9 +750,29 @@ impl MachInstEmitState<Inst> for EmitState {
     fn ssbb_barrier_count(&self) -> u32 {
         self.ssbb.as_ref().map(|ssbb| ssbb.barriers).unwrap_or(0)
     }
+
+    fn v4_set_selective(&mut self, active: bool) {
+        if let Some(ssbb) = self.ssbb.as_mut() {
+            ssbb.selective = active;
+        }
+    }
+
+    fn v4_set_legacy_internal(&mut self, active: bool) {
+        if let Some(ssbb) = self.ssbb.as_mut() {
+            ssbb.legacy_internal = active;
+            if active {
+                ssbb.dirty = true;
+            }
+        }
+    }
 }
 
 impl EmitState {
+    fn selective_internal(&self) -> bool {
+        self.ssbb
+            .as_ref()
+            .is_some_and(|ssbb| ssbb.selective && ssbb.legacy_internal)
+    }
     fn take_stack_map(&mut self) -> Option<ir::UserStackMap> {
         self.user_stack_map.take()
     }
@@ -774,6 +798,9 @@ impl EmitState {
         let Some(ssbb) = self.ssbb.as_mut() else {
             return;
         };
+        if ssbb.selective && !ssbb.legacy_internal {
+            return;
+        }
         if crate::machinst::ssbb::SsbbSeq::needs_guard(ssbb.dirty, step) {
             sink.put4(super::ssbb::SSBB_ENCODING);
             ssbb.barriers += 1;
@@ -834,6 +861,22 @@ impl MachInstEmit for Inst {
         // to allow disabling the check for `JTSequence`, which is always
         // emitted following an `EmitIsland`.
         let mut start_off = sink.cur_offset();
+
+        // Frozen complex templates retain an entry guard. In particular this
+        // precedes the jump-table default branch, so every outgoing edge sees
+        // the same actual barrier that the frozen event graph describes.
+        if state.selective_internal()
+            && matches!(
+                self,
+                Inst::JTSequence { .. }
+                    | Inst::LoadExtNameGot { .. }
+                    | Inst::LoadExtNameFar { .. }
+                    | Inst::ElfTlsGetAddr { .. }
+                    | Inst::MachOTlsGetAddr { .. }
+            )
+        {
+            state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Load, sink);
+        }
 
         match self {
             &Inst::AluRRR {
@@ -3061,7 +3104,7 @@ impl MachInstEmit for Inst {
                 let start = sink.cur_offset();
                 let user_stack_map = state.take_stack_map();
                 let internal = call_retval_needs_internal_ssbb(info, state);
-                if internal {
+                if internal || state.selective_internal() {
                     state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Call, sink);
                 }
                 sink.add_reloc(Reloc::Arm64Call, &info.dest, 0);
@@ -3110,7 +3153,7 @@ impl MachInstEmit for Inst {
             &Inst::CallInd { ref info } => {
                 let user_stack_map = state.take_stack_map();
                 let internal = call_retval_needs_internal_ssbb(info, state);
-                if internal {
+                if internal || state.selective_internal() {
                     state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Call, sink);
                 }
                 sink.put4(
@@ -3764,6 +3807,16 @@ impl MachInstEmit for Inst {
         super::ssbb::classify(self, frame, flags)
     }
 
+    fn v4_seq(
+        &self,
+        frame: &FrameLayout,
+        flags: &settings::Flags,
+        _info: &EmitInfo,
+        context: &mut crate::machinst::v4_fences::V4Context,
+    ) -> crate::CodegenResult<crate::machinst::v4_fences::V4Seq> {
+        super::ssbb::classify_v4(self, frame, flags, context)
+    }
+
     fn ssbb_veneer_barrier() -> Option<u32> {
         Some(super::ssbb::SSBB_ENCODING)
     }
@@ -3849,7 +3902,18 @@ fn emit_return_call_common_sequence<T>(
     info: &ReturnCallInfo<T>,
 ) {
     for inst in return_call_setup_insts(state.frame_layout(), &emit_info.flags, info) {
+        if state.selective_internal() {
+            let seq = super::ssbb::classify(&inst, state.frame_layout(), &emit_info.flags)
+                .expect("audited frozen tail restore");
+            for step in seq.steps {
+                state.ssbb_step(step, sink);
+            }
+        }
         inst.emit(sink, emit_info, state);
+    }
+
+    if state.selective_internal() {
+        state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Call, sink);
     }
 
     if let Some(key) = info.key {

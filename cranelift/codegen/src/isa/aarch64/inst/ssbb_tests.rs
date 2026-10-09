@@ -20,6 +20,580 @@ use cranelift_control::ControlPlane;
 const SSBB: u32 = SSBB_ENCODING;
 const CSDB: u32 = 0xD503229F;
 
+fn selective_seq(
+    inst: &Inst,
+    context: &mut crate::machinst::v4_fences::V4Context,
+) -> crate::machinst::v4_fences::V4Seq {
+    super::classify_v4(
+        inst,
+        &FrameLayout::default(),
+        &settings::Flags::new(settings::builder()),
+        context,
+    )
+    .unwrap()
+}
+
+#[test]
+fn selective_narrow_vector_pair_and_atomic_widths() {
+    use crate::isa::aarch64::inst::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy, V4Range};
+    let flags = MemFlags::trusted();
+    let mut context = V4Context::new(7, V4Policy::Ranges);
+    let mem = AMode::reg(xreg(0));
+    for (inst, width) in [
+        (
+            Inst::SLoad8 {
+                rd: writable_xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            1,
+        ),
+        (
+            Inst::SLoad16 {
+                rd: writable_xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            2,
+        ),
+        (
+            Inst::SLoad32 {
+                rd: writable_xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            4,
+        ),
+        (
+            Inst::ULoad64 {
+                rd: writable_xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            8,
+        ),
+        (
+            Inst::FpuLoad128 {
+                rd: writable_vreg(1),
+                mem,
+                flags,
+            },
+            16,
+        ),
+        (
+            Inst::VecLoadReplicate {
+                rd: writable_vreg(1),
+                rn: xreg(0),
+                size: VectorSize::Size16x8,
+                flags,
+            },
+            2,
+        ),
+        (
+            Inst::LoadP64 {
+                rt: writable_xreg(1),
+                rt2: writable_xreg(2),
+                mem: PairAMode::SignedOffset {
+                    reg: xreg(0),
+                    simm7: SImm7Scaled::maybe_from_i64(16, types::I64).unwrap(),
+                },
+                flags,
+            },
+            16,
+        ),
+        (
+            Inst::FpuLoadP128 {
+                rt: writable_vreg(1),
+                rt2: writable_vreg(2),
+                mem: PairAMode::SignedOffset {
+                    reg: xreg(0),
+                    simm7: SImm7Scaled::maybe_from_i64(16, types::I8X16).unwrap(),
+                },
+                flags,
+            },
+            32,
+        ),
+    ] {
+        let seq = selective_seq(&inst, &mut context);
+        assert!(
+            matches!(seq.events[0], V4Event::Load(V4Range::LocalBase { width: actual, .. }) if actual == width),
+            "{inst:?}: {seq:?}"
+        );
+    }
+    for ty in [types::I8, types::I16, types::I32, types::I64] {
+        let inst = Inst::AtomicCAS {
+            rd: writable_xreg(1),
+            rs: xreg(1),
+            rt: xreg(2),
+            rn: xreg(0),
+            ty,
+            flags,
+        };
+        let seq = selective_seq(&inst, &mut context);
+        assert!(
+            matches!(seq.events[0], V4Event::Rmw(V4Range::LocalBase { width, .. }, V4Range::LocalBase { width: write, .. }) if width == ty.bytes() && write == width)
+        );
+    }
+    let mem = AMode::reg(xreg(0));
+    for (inst, width) in [
+        (
+            Inst::Store8 {
+                rd: xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            1,
+        ),
+        (
+            Inst::Store16 {
+                rd: xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            2,
+        ),
+        (
+            Inst::Store32 {
+                rd: xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            4,
+        ),
+        (
+            Inst::Store64 {
+                rd: xreg(1),
+                mem: mem.clone(),
+                flags,
+            },
+            8,
+        ),
+        (
+            Inst::FpuStore128 {
+                rd: vreg(1),
+                mem,
+                flags,
+            },
+            16,
+        ),
+        (
+            Inst::FpuStoreP128 {
+                rt: vreg(1),
+                rt2: vreg(2),
+                mem: PairAMode::SignedOffset {
+                    reg: xreg(0),
+                    simm7: SImm7Scaled::maybe_from_i64(0, types::I8X16).unwrap(),
+                },
+                flags,
+            },
+            32,
+        ),
+    ] {
+        let seq = selective_seq(&inst, &mut context);
+        assert!(
+            matches!(seq.events[0], V4Event::Store(V4Range::LocalBase { width: actual, .. }) if actual == width),
+            "{inst:?}: {seq:?}"
+        );
+    }
+}
+
+#[test]
+fn selective_writeback_uses_old_address_then_invalidates_loaded_fp() {
+    use crate::isa::aarch64::inst::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy, V4Range};
+    let mut context = V4Context::new(0, V4Policy::Frame);
+    context.set_frame_offset(stack_reg(), Some(0));
+    let push = Inst::StoreP64 {
+        rt: fp_reg(),
+        rt2: link_reg(),
+        mem: PairAMode::SPPreIndexed {
+            simm7: SImm7Scaled::maybe_from_i64(-16, types::I64).unwrap(),
+        },
+        flags: MemFlags::trusted(),
+    };
+    assert_eq!(
+        selective_seq(&push, &mut context).events[0],
+        V4Event::Store(V4Range::Frame {
+            frame: 0,
+            offset: -16,
+            width: 16
+        })
+    );
+    assert_eq!(context.frame_offset(stack_reg()), Some(-16));
+    let bind = Inst::AluRRImm12 {
+        alu_op: ALUOp::Add,
+        size: OperandSize::Size64,
+        rd: writable_fp_reg(),
+        rn: stack_reg(),
+        imm12: Imm12::ZERO,
+    };
+    selective_seq(&bind, &mut context);
+    assert_eq!(context.frame_offset(fp_reg()), Some(-16));
+    let pop = Inst::LoadP64 {
+        rt: writable_fp_reg(),
+        rt2: writable_link_reg(),
+        mem: PairAMode::SPPostIndexed {
+            simm7: SImm7Scaled::maybe_from_i64(16, types::I64).unwrap(),
+        },
+        flags: MemFlags::trusted(),
+    };
+    let seq = selective_seq(&pop, &mut context);
+    assert_eq!(
+        seq.events[0],
+        V4Event::Load(V4Range::Frame {
+            frame: 0,
+            offset: -16,
+            width: 16
+        })
+    );
+    assert!(seq.events.contains(&V4Event::RegisterDef(fp_reg())));
+    assert_eq!(context.frame_offset(stack_reg()), Some(0));
+    assert_eq!(context.frame_offset(fp_reg()), None);
+}
+
+#[test]
+fn selective_old_effective_address_precedes_w_alias_definition() {
+    use crate::isa::aarch64::inst::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy, V4Range};
+    let mut context = V4Context::new(3, V4Policy::Ranges);
+    let load = Inst::ULoad32 {
+        rd: writable_xreg(0),
+        mem: AMode::reg(xreg(0)),
+        flags: MemFlags::trusted(),
+    };
+    let seq = selective_seq(&load, &mut context);
+    assert_eq!(
+        seq.events[0],
+        V4Event::Load(V4Range::LocalBase {
+            block: 3,
+            reg: xreg(0),
+            epoch: 0,
+            offset: 0,
+            width: 4
+        })
+    );
+    assert!(seq.events[1..].contains(&V4Event::RegisterDef(xreg(0))));
+    assert_eq!(
+        context.local_base(xreg(0), 0, 8),
+        V4Range::LocalBase {
+            block: 3,
+            reg: xreg(0),
+            epoch: 1,
+            offset: 0,
+            width: 8
+        }
+    );
+    for mem in [
+        AMode::RegReg {
+            rn: xreg(0),
+            rm: xreg(2),
+        },
+        AMode::RegScaled {
+            rn: xreg(0),
+            rm: xreg(2),
+        },
+        AMode::RegExtended {
+            rn: xreg(0),
+            rm: xreg(2),
+            extendop: ExtendOp::UXTW,
+        },
+    ] {
+        let seq = selective_seq(
+            &Inst::ULoad64 {
+                rd: writable_xreg(1),
+                mem,
+                flags: MemFlags::trusted(),
+            },
+            &mut context,
+        );
+        assert_eq!(seq.events[0], V4Event::Load(V4Range::Unknown));
+    }
+}
+
+#[test]
+fn selective_single_simd_writeback_and_large_frame_offsets() {
+    use crate::isa::aarch64::inst::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy, V4Range};
+    let mut context = V4Context::new(0, V4Policy::Frame);
+    context.set_frame_offset(stack_reg(), Some(-128));
+    let inst = Inst::FpuLoad64 {
+        rd: writable_vreg(0),
+        mem: AMode::SPPostIndexed {
+            simm9: SImm9::maybe_from_i64(16).unwrap(),
+        },
+        flags: MemFlags::trusted(),
+    };
+    assert_eq!(
+        selective_seq(&inst, &mut context).events[0],
+        V4Event::Load(V4Range::Frame {
+            frame: 0,
+            offset: -128,
+            width: 8
+        })
+    );
+    assert_eq!(context.frame_offset(stack_reg()), Some(-112));
+    let mut frame = FrameLayout::default();
+    frame.outgoing_args_size = 64;
+    let inst = Inst::Store64 {
+        rd: xreg(0),
+        mem: AMode::SlotOffset { off: 40_000 },
+        flags: MemFlags::trusted(),
+    };
+    let seq = super::classify_v4(
+        &inst,
+        &frame,
+        &settings::Flags::new(settings::builder()),
+        &mut context,
+    )
+    .unwrap();
+    assert_eq!(
+        seq.events[0],
+        V4Event::Store(V4Range::Frame {
+            frame: 0,
+            offset: 39_952,
+            width: 8
+        })
+    );
+    assert!(seq.events.contains(&V4Event::RegisterDef(spilltmp_reg())));
+    let inst = Inst::ULoad64 {
+        rd: writable_xreg(0),
+        mem: AMode::RegOffset {
+            rn: xreg(1),
+            off: 40_000,
+        },
+        flags: MemFlags::trusted(),
+    };
+    let seq = selective_seq(&inst, &mut context);
+    assert_eq!(seq.events[0], V4Event::Load(V4Range::Unknown));
+}
+
+fn compile_policy(policy: &str, func: Function) -> Compiled {
+    let mut shared = settings::builder();
+    shared.set("opt_level", "none").unwrap();
+    shared.set("v4_fence_policy", policy).unwrap();
+    let mut builder = isa::lookup("aarch64".parse().unwrap()).unwrap();
+    builder.set("has_lse", "true").unwrap();
+    builder.set("aarch64_mitigation", "ssbb").unwrap();
+    let isa = builder.finish(settings::Flags::new(shared)).unwrap();
+    let mut ctx = Context::for_function(func);
+    ctx.set_disasm(true);
+    match ctx.compile(&*isa, &mut ControlPlane::default()) {
+        Ok(code) => Compiled {
+            bytes: code.buffer.data().to_vec(),
+            disasm: code.vcode.clone().unwrap_or_default(),
+            traps: code.buffer.traps().len(),
+        },
+        Err(err) => panic!("compile {policy} failed: {:?}", err.inner),
+    }
+}
+
+fn disjoint_range_load(alias_after: bool) -> Function {
+    let mut func = new_func(&[types::I64, types::I64], &[types::I64]);
+    let (mut pos, vals) = entry(&mut func, &[types::I64, types::I64]);
+    let first = pos.ins().load(types::I64, MemFlags::trusted(), vals[0], 32);
+    pos.ins().store(MemFlags::trusted(), vals[1], vals[0], 0);
+    let unrelated = pos.ins().load(types::I64, MemFlags::trusted(), vals[0], 16);
+    let mut sum = pos.ins().iadd(first, unrelated);
+    if alias_after {
+        let related = pos.ins().load(types::I64, MemFlags::trusted(), vals[0], 0);
+        sum = pos.ins().iadd(sum, related);
+    }
+    pos.ins().return_(&[sum]);
+    func
+}
+
+#[test]
+fn selective_native_codegen_moves_guard_and_keeps_nonfence_words() {
+    let legacy = compile_policy("legacy", disjoint_range_load(false));
+    let default = must_compile("ssbb", true, false, disjoint_range_load(false));
+    assert_eq!(
+        legacy.bytes, default.bytes,
+        "legacy must preserve default emission"
+    );
+    assert_eq!(count_word(&legacy.bytes, SSBB), 2, "{}", legacy.disasm);
+    for policy in ["frame", "ranges", "ranges_cfg"] {
+        let code = compile_policy(policy, disjoint_range_load(false));
+        assert_eq!(
+            count_word(&code.bytes, SSBB),
+            if policy == "frame" { 2 } else { 1 },
+            "{policy}: {}",
+            code.disasm
+        );
+        let nonfence = |code: &Compiled| {
+            words(&code.bytes)
+                .into_iter()
+                .filter(|word| *word != SSBB)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            nonfence(&code),
+            nonfence(&legacy),
+            "{policy} changed original native instructions"
+        );
+    }
+    let code = compile_policy("ranges", disjoint_range_load(true));
+    assert_eq!(count_word(&code.bytes, SSBB), 2, "{}", code.disasm);
+    // The second guard must follow the unrelated load, not precede it.
+    let lines: Vec<_> = code.disasm.lines().map(str::trim).collect();
+    let second_fence = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("dsb #0"))
+        .nth(1)
+        .unwrap()
+        .0;
+    assert!(
+        lines[..second_fence]
+            .iter()
+            .any(|line| line.starts_with("ldr ") && line.contains("#16")),
+        "{}",
+        code.disasm
+    );
+}
+
+#[test]
+fn selective_internal_templates_emit_exact_fixed_guard_count() {
+    use crate::isa::aarch64::inst::*;
+    use crate::machinst::v4_fences::{V4Context, V4Policy};
+    use crate::machinst::{MachInstEmit, MachInstEmitState};
+    let flags = settings::Flags::new(settings::builder());
+    let info = EmitInfo::new(flags.clone());
+    let symbol = alloc::boxed::Box::new(ExternalName::testcase("v4"));
+    let templates = [
+        Inst::LoadExtNameGot {
+            rd: writable_xreg(0),
+            name: symbol.clone(),
+        },
+        Inst::LoadExtNameFar {
+            rd: writable_xreg(0),
+            name: symbol.clone(),
+            offset: 0,
+        },
+        Inst::ElfTlsGetAddr {
+            rd: writable_xreg(0),
+            tmp: writable_xreg(1),
+            symbol: symbol.clone(),
+        },
+        Inst::MachOTlsGetAddr {
+            rd: writable_xreg(0),
+            symbol: *symbol,
+        },
+        Inst::ReturnCallInd {
+            info: alloc::boxed::Box::new(ReturnCallInfo {
+                dest: xreg(1),
+                uses: smallvec::smallvec![],
+                new_stack_arg_size: 0,
+                key: None,
+            }),
+        },
+    ];
+    for inst in templates {
+        let mut context = V4Context::new(0, V4Policy::Ranges);
+        let seq = super::classify_v4(&inst, &FrameLayout::default(), &flags, &mut context).unwrap();
+        assert!(seq.legacy_internal, "{inst:?}");
+        let mut state = EmitState::default();
+        state.ssbb_install(&[]);
+        state.v4_set_selective(true);
+        state.v4_set_legacy_internal(true);
+        let mut sink = MachBuffer::new();
+        inst.emit(&mut sink, &info, &mut state);
+        assert_eq!(
+            count_word(sink.testing_data(), SSBB),
+            seq.fixed_barriers() as usize,
+            "{inst:?}: {seq:?}"
+        );
+        assert_eq!(state.ssbb_barrier_count(), seq.fixed_barriers());
+    }
+    // Selective ordinary emission must not reinsert the legacy automatic guard.
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.v4_set_selective(true);
+    state.ssbb_set_dirty(true);
+    let mut sink = MachBuffer::new();
+    state.ssbb_step(SsbbMemStep::Load, &mut sink);
+    assert!(sink.testing_data().is_empty());
+}
+
+#[test]
+fn selective_try_call_cut_precedes_spilled_return_loads() {
+    use crate::isa::aarch64::inst::{EmitInfo, EmitState};
+    use crate::machinst::abi::{CallInfo, CallRetPair, RetLocation, StackAMode, TryCallInfo};
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy};
+    use crate::machinst::{MachInstEmit, MachInstEmitState, Reg, Writable};
+    let mut sink = MachBuffer::<Inst>::new();
+    let continuation = sink.get_label();
+    let mut info = CallInfo::empty(xreg(0), CallConv::SystemV);
+    for i in 0..2 {
+        info.defs.push(CallRetPair {
+            vreg: Writable::from_reg(Reg::from(regalloc2::SpillSlot::new(i))),
+            location: RetLocation::Stack(StackAMode::Slot((i * 8) as i64), types::I64),
+        });
+    }
+    info.try_call_info = Some(TryCallInfo {
+        continuation,
+        exception_handlers: alloc::boxed::Box::new([]),
+    });
+    let inst = Inst::CallInd {
+        info: alloc::boxed::Box::new(info),
+    };
+    let flags = settings::Flags::new(settings::builder());
+    let mut context = V4Context::new(0, V4Policy::Ranges);
+    let seq = super::classify_v4(&inst, &FrameLayout::default(), &flags, &mut context).unwrap();
+    assert_eq!(seq.exn_cut, Some(1));
+    assert_eq!(seq.events[seq.exn_cut.unwrap()], V4Event::OpaqueCall);
+    assert_eq!(seq.fixed_barriers(), 3, "{seq:?}");
+    assert!(
+        seq.events
+            .iter()
+            .skip(2)
+            .any(|event| matches!(event, V4Event::Store(_)))
+    );
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.v4_set_selective(true);
+    state.v4_set_legacy_internal(true);
+    inst.emit(&mut sink, &EmitInfo::new(flags), &mut state);
+    assert_eq!(
+        count_word(sink.testing_data(), SSBB),
+        seq.fixed_barriers() as usize
+    );
+}
+
+#[test]
+fn selective_fixed_native_stack_ranges_reduce_guard_count() {
+    let make_func = || {
+        let mut func = new_func(&[types::I64], &[types::I64]);
+        let slot = func.create_sized_stack_slot(crate::ir::StackSlotData::new(
+            crate::ir::StackSlotKind::ExplicitSlot,
+            64,
+            3,
+        ));
+        let (mut pos, vals) = entry(&mut func, &[types::I64]);
+        let first = pos.ins().stack_load(types::I64, slot, 32);
+        pos.ins().stack_store(vals[0], slot, 0);
+        let unrelated = pos.ins().stack_load(types::I64, slot, 16);
+        let sum = pos.ins().iadd(first, unrelated);
+        pos.ins().return_(&[sum]);
+        func
+    };
+    let legacy = compile_policy("legacy", make_func());
+    let optimized = compile_policy("frame", make_func());
+    assert!(
+        count_word(&optimized.bytes, SSBB) < count_word(&legacy.bytes, SSBB),
+        "legacy:\n{}\nframe:\n{}",
+        legacy.disasm,
+        optimized.disasm
+    );
+    let nonfence = |code: &Compiled| {
+        words(&code.bytes)
+            .into_iter()
+            .filter(|word| *word != SSBB)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(nonfence(&legacy), nonfence(&optimized));
+}
+
 fn words(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(4)
@@ -335,6 +909,15 @@ fn ssbb_join_and_loop_back_edge() {
         let joined = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 8);
         pos.ins().return_(&[joined]);
     }
+    for policy in ["frame", "ranges", "ranges_cfg"] {
+        let joined = compile_policy(policy, func.clone());
+        assert_eq!(
+            count_word(&joined.bytes, SSBB),
+            2,
+            "{policy}: {}",
+            joined.disasm
+        );
+    }
     let join = must_compile("ssbb", true, false, func);
     assert_eq!(count_word(&join.bytes, SSBB), 2, "{}", join.disasm);
     assert_disasm_follows_rule(&join.disasm);
@@ -357,6 +940,15 @@ fn ssbb_join_and_loop_back_edge() {
         pos.ins().jump(b_loop, no_args());
         pos.insert_block(b_exit);
         pos.ins().return_(&[cleared]);
+    }
+    for policy in ["frame", "ranges", "ranges_cfg"] {
+        let looped = compile_policy(policy, func.clone());
+        assert_eq!(
+            count_word(&looped.bytes, SSBB),
+            2,
+            "{policy} must retain protection on the store backedge: {}",
+            looped.disasm
+        );
     }
     let looped = must_compile("ssbb", true, false, func);
     assert_eq!(count_word(&looped.bytes, SSBB), 2, "{}", looped.disasm);
@@ -403,9 +995,9 @@ fn ssbb_call_atomic_and_existing_dmb() {
         let mut func = new_func(&[types::I64, ty], &[ty]);
         {
             let (mut pos, vals) = entry(&mut func, &[types::I64, ty]);
-            let updated = pos
-                .ins()
-                .atomic_rmw(ty, MemFlags::trusted(), AtomicRmwOp::Xchg, vals[0], vals[1]);
+            let updated =
+                pos.ins()
+                    .atomic_rmw(ty, MemFlags::trusted(), AtomicRmwOp::Xchg, vals[0], vals[1]);
             pos.ins().return_(&[updated]);
         }
         let code = must_compile("ssbb", true, false, func);
@@ -455,6 +1047,19 @@ fn ssbb_spills_vectors_and_multiple_returns() {
             acc = pos.ins().iadd(acc, value);
         }
         pos.ins().return_(&[acc]);
+    }
+    for policy in ["frame", "ranges", "ranges_cfg"] {
+        let spilled = compile_policy(policy, func.clone());
+        assert!(
+            count_word(&spilled.bytes, SSBB) >= 2,
+            "{policy} must protect the call and regalloc reloads: {}",
+            spilled.disasm
+        );
+        assert!(
+            spilled.disasm.contains("str ") || spilled.disasm.contains("stur "),
+            "{}",
+            spilled.disasm
+        );
     }
     let spilled = must_compile("ssbb", true, false, func);
     assert!(
@@ -748,12 +1353,8 @@ fn gap64() -> Function {
     let old = pos
         .ins()
         .atomic_cas(MemFlags::trusted(), vals[0], vals[1], vals[2]);
-    let ptr = pos
-        .ins()
-        .load(types::I64, MemFlags::trusted(), vals[0], 0);
-    let touched = pos
-        .ins()
-        .load(types::I64, MemFlags::trusted(), ptr, 0);
+    let ptr = pos.ins().load(types::I64, MemFlags::trusted(), vals[0], 0);
+    let touched = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
     let keep = pos.ins().iadd(old, touched);
     pos.ins().return_(&[keep]);
     func
@@ -774,21 +1375,14 @@ fn v4_gadget() -> Function {
         &[types::I64, types::I64, types::I64, types::I64],
         &[types::I64],
     );
-    let (mut pos, vals) = entry(
-        &mut func,
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
+    let (mut pos, vals) = entry(&mut func, &[types::I64, types::I64, types::I64, types::I64]);
     let mut addr = vals[0];
     for _ in 0..40 {
         addr = pos.ins().imul(addr, vals[1]);
     }
     pos.ins().store(MemFlags::trusted(), vals[2], addr, 0);
-    let ptr = pos
-        .ins()
-        .load(types::I64, MemFlags::trusted(), vals[3], 0);
-    let touched = pos
-        .ins()
-        .load(types::I64, MemFlags::trusted(), ptr, 0);
+    let ptr = pos.ins().load(types::I64, MemFlags::trusted(), vals[3], 0);
+    let touched = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
     pos.ins().return_(&[touched]);
     func
 }
@@ -814,7 +1408,12 @@ fn assert_cas_shape(code: &Compiled, want_csdb: bool) {
             cas += 1;
             let next = insns.get(index + 1).copied();
             if want_csdb {
-                assert_eq!(next, Some(CSDB), "CAS not followed by CSDB\n{}", code.disasm);
+                assert_eq!(
+                    next,
+                    Some(CSDB),
+                    "CAS not followed by CSDB\n{}",
+                    code.disasm
+                );
             }
         }
     }
@@ -875,7 +1474,11 @@ fn gadget_phase_e_dump() {
         ("v4-none-optnone", &v4_none_none),
         ("v4-ssbb-optnone", &v4_none_ssbb),
     ] {
-        let opt = if label.ends_with("speed") { "speed" } else { "none" };
+        let opt = if label.ends_with("speed") {
+            "speed"
+        } else {
+            "none"
+        };
         write_disasm(&dir, label, opt, code);
     }
 
@@ -891,7 +1494,12 @@ fn gadget_phase_e_dump() {
         );
         ("none", &v4_none_none, &v4_none_ssbb)
     };
-    assert_eq!(count_word(&v4_none_code.bytes, SSBB), 0, "{}", v4_none_code.disasm);
+    assert_eq!(
+        count_word(&v4_none_code.bytes, SSBB),
+        0,
+        "{}",
+        v4_none_code.disasm
+    );
     assert!(
         count_word(&v4_ssbb_code.bytes, SSBB) >= 1,
         "ssbb gadget has no SSBB\n{}",

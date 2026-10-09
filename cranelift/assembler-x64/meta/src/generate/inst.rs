@@ -59,6 +59,12 @@ impl dsl::Inst {
         f.add_block(&format!("{impl_block} {struct_name}"), |f| {
             self.generate_memory_access_function(f);
             f.empty_line();
+            self.generate_explicit_memory_function(f);
+            f.empty_line();
+            self.generate_stack_access_function(f);
+            f.empty_line();
+            self.generate_written_gprs_function(f);
+            f.empty_line();
             self.generate_new_function(f);
             f.empty_line();
             self.generate_mnemonic_function(f);
@@ -72,6 +78,126 @@ impl dsl::Inst {
             self.generate_features_function(f);
             f.empty_line();
             self.generate_num_registers_function(f);
+        });
+    }
+
+    fn generate_explicit_memory_function(&self, f: &mut Formatter) {
+        use dsl::OperandKind::*;
+        let generic = if self.requires_generic() {
+            ""
+        } else {
+            "<R: Registers>"
+        };
+        f.add_block(&format!("pub fn explicit_memory{generic}(&self) -> Option<crate::MemoryOperand<'_, R::ReadGpr>>"), |f| {
+            if matches!(self.mnemonic.as_str(), "leaw" | "leal" | "leaq" | "nop" | "nopl") {
+                fmtln!(f, "None");
+                return;
+            }
+            let operands = self.format.operands.iter().filter(|o| o.location.uses_memory()).collect::<Vec<_>>();
+            assert!(operands.len() <= 1, "multiple explicit memory operands need an ordered audit");
+            let Some(operand) = operands.first() else {
+                fmtln!(f, "None");
+                return;
+            };
+            let loc = operand.location;
+            let access = match (operand.mutability.is_read(), operand.mutability.is_write()) {
+                (true, false) => "Read",
+                (false, true) => "Write",
+                (true, true) => "ReadWrite",
+                (false, false) => unreachable!("memory operand without an effect"),
+            };
+            // Lane instructions use rm32 in the DSL to match disassembly, but
+            // access one/two bytes in their memory form.
+            let bytes = match self.mnemonic.as_str() {
+                "pextrb" | "vpextrb" | "pinsrb" | "vpinsrb" => 1,
+                "pextrw" | "vpextrw" | "pinsrw" | "vpinsrw" => 2,
+                _ => loc.bytes(),
+            };
+            let value = format!("Some(crate::MemoryOperand {{ address, access: crate::MemoryAccess::{access}, bytes: {bytes} }})");
+            match loc.kind() {
+                Mem(_) => {
+                    fmtln!(f, "let address = &self.{loc};");
+                    fmtln!(f, "{value}");
+                }
+                RegMem(_) => f.add_block(&format!("match &self.{loc}"), |f| {
+                    let class = loc.reg_class().unwrap();
+                    fmtln!(f, "{class}Mem::Mem(address) => {value},");
+                    fmtln!(f, "{class}Mem::{class}(..) => None,");
+                }),
+                _ => unreachable!(),
+            }
+        });
+    }
+
+    fn generate_stack_access_function(&self, f: &mut Formatter) {
+        f.add_block("pub fn stack_access(&self) -> crate::StackAccess", |f| {
+            let effect = match self.mnemonic.as_str() {
+                "pushw" => "Push { bytes: 2 }",
+                "pushq" => "Push { bytes: 8 }",
+                "popw" => "Pop { bytes: 2 }",
+                "popq" => "Pop { bytes: 8 }",
+                "retq" => "Return",
+                "callq" => "Call",
+                _ => "None",
+            };
+            fmtln!(f, "crate::StackAccess::{effect}");
+        });
+    }
+
+    fn generate_written_gprs_function(&self, f: &mut Formatter) {
+        use dsl::OperandKind::*;
+        f.add_block("pub fn written_gprs(&self) -> alloc::vec::Vec<u8>", |f| {
+            let mut writes = Vec::new();
+            for op in &self.format.operands {
+                if !op.mutability.is_write()
+                    || !matches!(op.location.reg_class(), Some(dsl::RegClass::Gpr))
+                {
+                    continue;
+                }
+                let loc = op.location;
+                match loc.kind() {
+                    FixedReg(_) => writes.push(format!("self.{loc}.0.enc()")),
+                    Reg(_) => writes.push(format!("self.{loc}.as_ref().enc()")),
+                    RegMem(_) => {
+                        fmtln!(f, "let mut writes = alloc::vec::Vec::new();");
+                        f.add_block(&format!("if let GprMem::Gpr(reg) = &self.{loc}"), |f| {
+                            fmtln!(f, "writes.push(reg.enc());");
+                        });
+                        for write in &writes {
+                            fmtln!(f, "writes.push({write});");
+                        }
+                        // There can be further implicit fixed writes (CMPXCHG).
+                        let position = self
+                            .format
+                            .operands
+                            .iter()
+                            .position(|x| x.location == loc)
+                            .unwrap();
+                        for other in self.format.operands.iter().skip(position + 1) {
+                            if other.mutability.is_write()
+                                && matches!(other.location.kind(), FixedReg(_))
+                                && matches!(other.location.reg_class(), Some(dsl::RegClass::Gpr))
+                            {
+                                let other = other.location;
+                                fmtln!(f, "writes.push(self.{other}.0.enc());");
+                            }
+                        }
+                        if matches!(self.mnemonic.as_str(), "popw" | "popq") {
+                            fmtln!(f, "writes.push(crate::gpr::enc::RSP);");
+                        }
+                        fmtln!(f, "writes");
+                        return;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if matches!(
+                self.mnemonic.as_str(),
+                "pushw" | "pushq" | "popw" | "popq" | "retq" | "callq"
+            ) {
+                writes.push("crate::gpr::enc::RSP".into());
+            }
+            fmtln!(f, "alloc::vec![{}]", writes.join(", "));
         });
     }
 

@@ -70,6 +70,7 @@ pub mod isle;
 pub mod lower;
 pub use lower::*;
 pub mod ssbb;
+pub mod v4_fences;
 pub mod vcode;
 pub use vcode::*;
 pub mod compile;
@@ -378,6 +379,19 @@ pub trait MachInstEmit: MachInst {
         Ok(ssbb::SsbbSeq::neutral())
     }
 
+    /// Audited final native effects for the selective Spectre-v4 checker.
+    fn v4_seq(
+        &self,
+        _frame: &FrameLayout,
+        _flags: &settings::Flags,
+        _info: &Self::Info,
+        _context: &mut v4_fences::V4Context,
+    ) -> CodegenResult<v4_fences::V4Seq> {
+        Err(crate::CodegenError::Unsupported(alloc::format!(
+            "selective Spectre-v4 effects unsupported for instruction {self:?}"
+        )))
+    }
+
     /// Width of an inserted store-to-load barrier.
     fn ssbb_barrier_size() -> u32 {
         4
@@ -428,6 +442,14 @@ pub trait MachInstEmitState<I: VCodeInst>: Default + Clone + Debug {
 
     /// Install per-block SSBB entry state. Default is a no-op.
     fn ssbb_install(&mut self, _block_in: &[bool]) {}
+
+    /// Suppress automatic legacy guards for ordinary instructions. Fixed
+    /// complex-expansion guards remain available through `v4_set_legacy_internal`.
+    fn v4_set_selective(&mut self, _active: bool) {}
+
+    /// Select fixed legacy emission for this outer instruction. In selective
+    /// mode a true value must reset its legacy dirty state to true.
+    fn v4_set_legacy_internal(&mut self, _active: bool) {}
 
     /// SSBB mode is active for this emission.
     fn ssbb_active(&self) -> bool {

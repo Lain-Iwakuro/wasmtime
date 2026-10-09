@@ -122,6 +122,40 @@ impl Engine {
         #[cfg(any(feature = "cranelift", feature = "winch"))]
         let (config, compiler) = if config.has_compiler() {
             let (config, compiler) = config.build_compiler(&mut tunables, features)?;
+            let flags = compiler.flags();
+            let policy = flags
+                .iter()
+                .find(|(name, _)| *name == "v4_fence_policy")
+                .map(|(_, value)| value);
+            let rule = flags
+                .iter()
+                .find(|(name, _)| *name == "v4_fence_rule_version")
+                .map(|(_, value)| value);
+            if let Some(rule) = rule {
+                crate::ensure!(
+                    *rule == FlagValue::Num(1),
+                    "unsupported v4 fence rule version"
+                );
+            }
+            if let Some(policy) = policy {
+                if *policy != FlagValue::Enum("legacy") {
+                    let isa_flags = compiler.isa_flags();
+                    let required = match compiler.triple().architecture {
+                        target_lexicon::Architecture::X86_64 => ("x64_mitigation", "lfence"),
+                        target_lexicon::Architecture::Aarch64 { .. } => {
+                            ("aarch64_mitigation", "ssbb")
+                        }
+                        _ => crate::bail!("selective v4 fence policy requires AArch64 or x64"),
+                    };
+                    crate::ensure!(
+                        isa_flags.iter().any(|(name, value)| *name == required.0
+                            && *value == FlagValue::Enum(required.1)),
+                        "selective v4 fence policy requires {}={}",
+                        required.0,
+                        required.1
+                    );
+                }
+            }
             (config, Some(compiler))
         } else {
             (config.clone(), None)
@@ -445,6 +479,8 @@ information about this check\
             "enable_probestack" => *value == FlagValue::Bool(true),
             "probestack_strategy" => *value == FlagValue::Enum("inline"),
             "enable_multi_ret_implicit_sret" => *value == FlagValue::Bool(true),
+            "v4_fence_policy" => matches!(value, FlagValue::Enum("legacy" | "frame" | "ranges" | "ranges_cfg")),
+            "v4_fence_rule_version" => *value == FlagValue::Num(1),
 
             // Features wasmtime doesn't use should all be disabled, since
             // otherwise if they are enabled it could change the behavior of

@@ -23,6 +23,8 @@ pub struct EmitState {
     // An outer expansion already accounted for all effects; recursive emits
     // must not account for them a second time.
     pub(crate) ssbb_suppressed: bool,
+    v4_selective: bool,
+    v4_legacy_internal: bool,
 }
 
 impl MachInstEmitState<Inst> for EmitState {
@@ -55,6 +57,16 @@ impl MachInstEmitState<Inst> for EmitState {
     fn ssbb_barrier_count(&self) -> u32 {
         self.ssbb_barriers
     }
+    fn v4_set_selective(&mut self, active: bool) {
+        self.v4_selective = active;
+    }
+    fn v4_set_legacy_internal(&mut self, active: bool) {
+        self.v4_legacy_internal = active;
+        if active {
+            self.ssbb_dirty = true;
+            self.ssbb_suppressed = false;
+        }
+    }
     fn ssbb_emit_barrier(&mut self, sink: &mut MachBuffer<Inst>, _info: &EmitInfo) {
         sink.put_data(&[0x0f, 0xae, 0xe8]);
         self.ssbb_dirty = false;
@@ -79,6 +91,9 @@ impl MachInstEmitState<Inst> for EmitState {
 }
 
 impl EmitState {
+    pub(crate) fn ssbb_auto_active(&self) -> bool {
+        self.ssbb_active && (!self.v4_selective || self.v4_legacy_internal)
+    }
     pub(crate) fn ssbb_step(
         &mut self,
         step: crate::machinst::ssbb::SsbbMemStep,
@@ -86,7 +101,7 @@ impl EmitState {
         info: &EmitInfo,
     ) {
         use crate::machinst::ssbb::SsbbSeq;
-        if self.ssbb_active && !self.ssbb_suppressed {
+        if self.ssbb_auto_active() && !self.ssbb_suppressed {
             if SsbbSeq::needs_guard(self.ssbb_dirty, step) {
                 self.ssbb_emit_barrier(sink, info);
             }

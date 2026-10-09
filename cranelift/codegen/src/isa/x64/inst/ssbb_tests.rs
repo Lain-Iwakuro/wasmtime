@@ -12,8 +12,13 @@ use alloc::vec::Vec;
 use cranelift_control::ControlPlane;
 
 fn compile(func: Function, mode: Option<&str>) -> Vec<u8> {
+    compile_policy(func, mode, "legacy")
+}
+
+fn compile_policy(func: Function, mode: Option<&str>, policy: &str) -> Vec<u8> {
     let mut shared = settings::builder();
     shared.set("opt_level", "none").unwrap();
+    shared.set("v4_fence_policy", policy).unwrap();
     let mut builder = isa::lookup("x86_64-unknown-linux-gnu".parse().unwrap()).unwrap();
     if let Some(mode) = mode {
         builder.set("x64_mitigation", mode).unwrap();
@@ -25,6 +30,411 @@ fn compile(func: Function, mode: Option<&str>) -> Vec<u8> {
         .buffer
         .data()
         .to_vec()
+}
+
+#[test]
+fn selective_native_metadata_keeps_narrow_width_and_old_ea_epoch() {
+    use super::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy, V4Range};
+    let info = raw_info();
+    let mut context = V4Context::new(3, V4Policy::Ranges);
+    let memory = || Amode::imm_reg(16, regs::rdi());
+    let load = Inst::External {
+        inst: asm::inst::movzbq_rm::new(Writable::from_reg(Gpr::RDI), memory()).into(),
+    };
+    let seq =
+        super::ssbb::classify_v4(&load, &FrameLayout::default(), &info, &mut context).unwrap();
+    assert_eq!(
+        seq.events[0],
+        V4Event::Load(V4Range::LocalBase {
+            block: 3,
+            reg: regs::rdi(),
+            epoch: 0,
+            offset: 16,
+            width: 1,
+        })
+    );
+    assert_eq!(seq.events[1], V4Event::RegisterDef(regs::rdi()));
+    let partial = Inst::External {
+        inst: asm::inst::movb_mr::new(Writable::from_reg(Gpr::RDI), Gpr::RSI).into(),
+    };
+    super::ssbb::classify_v4(&partial, &FrameLayout::default(), &info, &mut context).unwrap();
+    assert_eq!(
+        context.local_base(regs::rdi(), 0, 8),
+        V4Range::LocalBase {
+            block: 3,
+            reg: regs::rdi(),
+            epoch: 2,
+            offset: 0,
+            width: 8,
+        }
+    );
+}
+
+#[test]
+fn selective_native_frame_tracks_push_pop_ret_without_recovering_reloaded_fp() {
+    use super::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy, V4Range};
+    let info = raw_info();
+    let mut context = V4Context::new(0, V4Policy::Frame);
+    context.external_entry = true;
+    let instructions = [
+        asm::inst::pushq_o::new(Gpr::RBP).into(),
+        asm::inst::movq_mr::new(Writable::from_reg(Gpr::RBP), Gpr::RSP).into(),
+        asm::inst::popq_o::new(Writable::from_reg(Gpr::RBP)).into(),
+        asm::inst::retq_zo::new().into(),
+    ];
+    let mut events = Vec::new();
+    for inst in instructions {
+        let seq = super::ssbb::classify_v4(
+            &Inst::External { inst },
+            &FrameLayout::default(),
+            &info,
+            &mut context,
+        )
+        .unwrap();
+        events.extend(seq.events);
+    }
+    assert!(events.contains(&V4Event::Store(V4Range::Frame {
+        frame: 0,
+        offset: -8,
+        width: 8
+    })));
+    assert!(events.contains(&V4Event::Load(V4Range::Frame {
+        frame: 0,
+        offset: -8,
+        width: 8
+    })));
+    assert!(events.contains(&V4Event::Load(V4Range::Frame {
+        frame: 0,
+        offset: 0,
+        width: 8
+    })));
+    assert_eq!(context.frame_offset(regs::rbp()), None);
+}
+
+#[test]
+fn selective_frame_resolves_emission_known_offsets_and_rejects_indexed_addresses() {
+    use super::*;
+    use crate::machinst::v4_fences::{V4Context, V4Event, V4Policy, V4Range};
+    let info = raw_info();
+    let frame = FrameLayout {
+        outgoing_args_size: 24,
+        tail_args_size: 16,
+        setup_area_size: 16,
+        ..FrameLayout::default()
+    };
+    let mut context = V4Context::new(1, V4Policy::Ranges);
+    context.set_frame_offset(regs::rsp(), Some(-40));
+    context.set_frame_offset(regs::rbp(), Some(-8));
+    for (address, expected) in [
+        (
+            SyntheticAmode::SlotOffset { simm32: 8 },
+            V4Range::Frame {
+                frame: 0,
+                offset: -8,
+                width: 1,
+            },
+        ),
+        (
+            SyntheticAmode::IncomingArg { offset: 8 },
+            V4Range::Frame {
+                frame: 0,
+                offset: 16,
+                width: 1,
+            },
+        ),
+    ] {
+        let inst = Inst::External {
+            inst: asm::inst::movzbq_rm::new(
+                Writable::from_reg(Gpr::RAX),
+                asm::Amode::<Gpr>::from(address),
+            )
+            .into(),
+        };
+        let seq = super::ssbb::classify_v4(&inst, &frame, &info, &mut context).unwrap();
+        assert_eq!(seq.events[0], V4Event::Load(expected));
+    }
+    for address in [
+        asm::Amode::ImmReg {
+            base: Gpr::RDI,
+            simm32: asm::AmodeOffsetPlusKnownOffset {
+                simm32: 0.into(),
+                offset: Some(255),
+            },
+            trap: None,
+        },
+        asm::Amode::ImmRegRegShift {
+            base: Gpr::RDI,
+            index: asm::NonRspGpr::new(Gpr::RSI),
+            scale: asm::Scale::One,
+            simm32: 0.into(),
+            trap: None,
+        },
+        asm::Amode::RipRelative {
+            target: asm::DeferredTarget::None,
+        },
+    ] {
+        let inst = Inst::External {
+            inst: asm::inst::movq_rm::new(Writable::from_reg(Gpr::RAX), address).into(),
+        };
+        assert_eq!(
+            super::ssbb::classify_v4(&inst, &frame, &info, &mut context)
+                .unwrap()
+                .events[0],
+            V4Event::Load(V4Range::Unknown)
+        );
+    }
+}
+
+#[test]
+fn selective_atomic_keeps_internal_retry_guards_and_suppresses_ordinary_auto_guards() {
+    use super::*;
+    use crate::machinst::v4_fences::{V4Context, V4Policy};
+    let info = raw_info();
+    let atomic = Inst::AtomicRmwSeq {
+        ty: types::I8,
+        op: AtomicRmwSeqOp::Nand,
+        mem: SyntheticAmode::real(Amode::imm_reg(0, regs::rdi())),
+        operand: Gpr::RSI,
+        temp: Writable::from_reg(Gpr::RDX),
+        dst_old: Writable::from_reg(Gpr::RAX),
+    };
+    let seq = super::ssbb::classify_v4(
+        &atomic,
+        &FrameLayout::default(),
+        &info,
+        &mut V4Context::new(0, V4Policy::Ranges),
+    )
+    .unwrap();
+    assert!(seq.legacy_internal);
+    assert_eq!(seq.fixed_barriers(), 2);
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.v4_set_selective(true);
+    state.v4_set_legacy_internal(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    atomic.emit(&mut sink, &info, &mut state);
+    state.v4_set_legacy_internal(false);
+    // The shared plan emits the post-RMW guard. The ordinary load must not
+    // silently add a second copy through the legacy emitter.
+    state.ssbb_emit_barrier(&mut sink, &info);
+    Inst::External {
+        inst: asm::inst::movzbq_rm::new(
+            Writable::from_reg(Gpr::RAX),
+            Amode::imm_reg(0, regs::rdi()),
+        )
+        .into(),
+    }
+    .emit(&mut sink, &info, &mut state);
+    let bytes = sink
+        .finish(&Default::default(), &mut ControlPlane::default())
+        .data()
+        .to_vec();
+    assert_eq!(fences(&bytes), 3, "{bytes:02x?}");
+    let cas = bytes
+        .windows(3)
+        .position(|b| b == [0xf0, 0x0f, 0xb0])
+        .unwrap();
+    assert_eq!(&bytes[cas - 3..cas], &[0x0f, 0xae, 0xe8]);
+    let branch = bytes.windows(2).position(|b| b == [0x0f, 0x85]).unwrap();
+    let displacement = i32::from_le_bytes(bytes[branch + 2..branch + 6].try_into().unwrap());
+    assert!((branch as i32 + 6 + displacement) as usize <= cas - 3);
+}
+
+#[test]
+fn selective_policies_compile_after_register_allocation() {
+    for policy in ["frame", "ranges", "ranges_cfg"] {
+        let bytes = compile_policy(store_load(), Some("lfence"), policy);
+        assert!(fences(&bytes) > 0, "{policy}: {bytes:02x?}");
+    }
+}
+
+fn selective_native_plan(
+    insts: &[super::Inst],
+    policy: crate::machinst::v4_fences::V4Policy,
+) -> (Vec<u8>, Vec<bool>) {
+    use super::*;
+    use crate::machinst::v4_fences::{self, V4Block, V4Context, V4EventId, V4Graph, V4Node};
+    let info = raw_info();
+    let frame = FrameLayout::default();
+    let mut context = V4Context::new(0, policy);
+    context.external_entry = true;
+    let sequences: Vec<_> = insts
+        .iter()
+        .map(|inst| super::ssbb::classify_v4(inst, &frame, &info, &mut context).unwrap())
+        .collect();
+    let mut events = Vec::new();
+    for (inst, seq) in sequences.iter().enumerate() {
+        for (sub, event) in seq.events.iter().copied().enumerate() {
+            events.push(V4Node {
+                id: V4EventId {
+                    block: 0,
+                    inst: inst as u32,
+                    sub: sub as u16,
+                },
+                event,
+                guard: (!seq.legacy_internal).then_some(inst),
+            });
+        }
+    }
+    let graph = V4Graph {
+        blocks: vec![V4Block {
+            events,
+            successors: vec![],
+            exit_site: None,
+            loop_depth: 0,
+        }],
+        entry: 0,
+        sites: insts.len(),
+    };
+    let plan = v4_fences::plan(&graph, policy).unwrap();
+    assert!(v4_fences::check(&graph, &plan.fences).errors.is_empty());
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.v4_set_selective(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    for (site, (inst, seq)) in insts.iter().zip(&sequences).enumerate() {
+        if plan.fences[site] {
+            state.ssbb_emit_barrier(&mut sink, &info);
+        }
+        state.v4_set_legacy_internal(seq.legacy_internal);
+        inst.emit(&mut sink, &info, &mut state);
+        state.v4_set_legacy_internal(false);
+    }
+    (
+        sink.finish(&Default::default(), &mut ControlPlane::default())
+            .data()
+            .to_vec(),
+        plan.fences,
+    )
+}
+
+#[test]
+fn selective_disjoint_load_keeps_pending_for_later_aliasing_folded_load() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let insts = [
+        Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        },
+        Inst::External {
+            inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rdi()), Gpr::RSI).into(),
+        },
+        Inst::External {
+            inst: asm::inst::movzbq_rm::new(
+                Writable::from_reg(Gpr::RAX),
+                Amode::imm_reg(16, regs::rdi()),
+            )
+            .into(),
+        },
+        Inst::External {
+            inst: asm::inst::addq_rm::new(
+                Writable::from_reg(Gpr::RAX),
+                Amode::imm_reg(4, regs::rdi()),
+            )
+            .into(),
+        },
+    ];
+    let (bytes, plan) = selective_native_plan(&insts, V4Policy::Ranges);
+    assert_eq!(plan, [false, false, false, true]);
+    assert_eq!(
+        bytes,
+        [
+            0x0f, 0xae, 0xe8, 0x48, 0x89, 0x37, 0x48, 0x0f, 0xb6, 0x47, 0x10, 0x0f, 0xae, 0xe8,
+            0x48, 0x03, 0x47, 0x04
+        ]
+    );
+    assert_eq!(
+        selective_native_plan(&insts, V4Policy::Frame).1,
+        [false, false, true, false]
+    );
+}
+
+#[test]
+fn selective_partial_write_and_reload_invalidate_store_address_proofs() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    for redefine in [
+        Inst::External {
+            inst: asm::inst::movb_mr::new(Writable::from_reg(Gpr::RDI), Gpr::RSI).into(),
+        },
+        Inst::External {
+            inst: asm::inst::movq_rm::new(
+                Writable::from_reg(Gpr::RDI),
+                Amode::imm_reg(0, regs::rsp()),
+            )
+            .into(),
+        },
+    ] {
+        let insts = [
+            Inst::External {
+                inst: asm::inst::lfence_zo::new().into(),
+            },
+            Inst::External {
+                inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rdi()), Gpr::RSI).into(),
+            },
+            redefine,
+            Inst::External {
+                inst: asm::inst::movq_rm::new(
+                    Writable::from_reg(Gpr::RAX),
+                    Amode::imm_reg(16, regs::rdi()),
+                )
+                .into(),
+            },
+        ];
+        let (_, plan) = selective_native_plan(&insts, V4Policy::Ranges);
+        assert!(
+            plan[2] || plan[3],
+            "redefinition lost pending store: {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn selective_native_frame_ranges_cover_sp_adjustment_and_return_load() {
+    use super::*;
+    use crate::machinst::v4_fences::V4Policy;
+    let insts = [
+        Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        },
+        Inst::subq_mi(Writable::from_reg(regs::rsp()), 32),
+        Inst::External {
+            inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rsp()), Gpr::RSI).into(),
+        },
+        Inst::External {
+            inst: asm::inst::movq_rm::new(
+                Writable::from_reg(Gpr::RAX),
+                Amode::imm_reg(16, regs::rsp()),
+            )
+            .into(),
+        },
+        Inst::addq_mi(Writable::from_reg(regs::rsp()), 32),
+        Inst::External {
+            inst: asm::inst::retq_zo::new().into(),
+        },
+    ];
+    let (_, plan) = selective_native_plan(&insts, V4Policy::Frame);
+    assert_eq!(
+        plan, [false; 6],
+        "fixed frame bytes are disjoint from the return address"
+    );
+    let insts = [
+        Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        },
+        Inst::External {
+            inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rsp()), Gpr::RSI).into(),
+        },
+        Inst::External {
+            inst: asm::inst::retq_zo::new().into(),
+        },
+    ];
+    assert_eq!(
+        selective_native_plan(&insts, V4Policy::Frame).1,
+        [false, false, true]
+    );
 }
 
 fn store_load() -> Function {
@@ -363,6 +773,13 @@ fn lfence_call_and_regalloc_spills_compile() {
         acc = pos.ins().iadd(acc, v);
     }
     pos.ins().return_(&[acc]);
+    for policy in ["frame", "ranges", "ranges_cfg"] {
+        let bytes = compile_policy(func.clone(), Some("lfence"), policy);
+        assert!(
+            fences(&bytes) >= 2,
+            "{policy} must protect call and post-call regalloc reloads: {bytes:02x?}"
+        );
+    }
     let bytes = compile(func, Some("lfence"));
     assert!(
         fences(&bytes) >= 3,

@@ -489,6 +489,8 @@ mod tests {
         let expected = r#"[shared]
 regalloc_algorithm = "backtracking"
 opt_level = "none"
+v4_fence_policy = "legacy"
+v4_fence_rule_version = 1
 tls_model = "none"
 stack_switch_model = "none"
 libcall_call_conv = "isa_default"

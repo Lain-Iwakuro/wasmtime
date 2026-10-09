@@ -56,6 +56,14 @@ impl AArch64Backend {
         domtree: &DominatorTree,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
+        crate::isa::validate_v4_shared(&self.triple, &self.flags)?;
+        if self.flags.v4_fence_policy() != shared_settings::V4FencePolicy::Legacy
+            && self.isa_flags.aarch64_mitigation() != aarch64_settings::Aarch64Mitigation::Ssbb
+        {
+            return Err(crate::CodegenError::Unsupported(String::from(
+                "selective v4_fence_policy requires aarch64_mitigation=ssbb",
+            )));
+        }
         match self.isa_flags.aarch64_mitigation() {
             aarch64_settings::Aarch64Mitigation::None => {}
             aarch64_settings::Aarch64Mitigation::CasCsdb => {

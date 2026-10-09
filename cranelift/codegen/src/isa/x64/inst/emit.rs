@@ -179,7 +179,7 @@ pub(crate) fn emit(
     // Run before any instruction offsets, relocations, or stack maps are
     // captured. Multi-access expansions place barriers at their inner emits.
     let was_suppressed = state.ssbb_suppressed;
-    if state.ssbb_active() && !was_suppressed {
+    if state.ssbb_auto_active() && !was_suppressed {
         let seq = super::ssbb::classify(inst, state.frame_layout(), info)
             .expect("LFENCE classification changed between planning and emission");
         if !seq.needs_internal() {

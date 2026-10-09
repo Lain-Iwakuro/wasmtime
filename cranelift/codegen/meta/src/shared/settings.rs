@@ -57,6 +57,25 @@ pub(crate) fn define() -> SettingGroup {
         vec!["none", "speed", "speed_and_size"],
     );
 
+    settings.add_enum(
+        "v4_fence_policy",
+        "Experimental selective Spectre-v4 fence placement.",
+        r#"
+            legacy preserves the original conservative emission path.
+            frame proves disjoint native stack ranges; ranges additionally proves
+            disjoint same-base byte offsets within one block. ranges_cfg also
+            moves validated fences to dirty predecessor exits. Non-legacy modes
+            require aarch64_mitigation=ssbb or x64_mitigation=lfence.
+        "#,
+        vec!["legacy", "frame", "ranges", "ranges_cfg"],
+    );
+    settings.add_num(
+        "v4_fence_rule_version",
+        "Version of the experimental v4 address and coverage rules.",
+        "Only version 1 is supported; this participates in cache and artifact compatibility.",
+        1,
+    );
+
     settings.add_bool(
         "enable_alias_analysis",
         "Do redundant-load optimizations with alias analysis.",

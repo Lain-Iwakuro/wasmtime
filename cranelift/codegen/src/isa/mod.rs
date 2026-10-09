@@ -106,6 +106,12 @@ macro_rules! isa_builder {
 /// Look for an ISA for the given `triple`.
 /// Return a builder that can create a corresponding `TargetIsa`.
 pub fn lookup(triple: Triple) -> Result<Builder, LookupError> {
+    let mut builder = lookup_unchecked(triple)?;
+    builder.constructor = v4_checked_constructor;
+    Ok(builder)
+}
+
+fn lookup_unchecked(triple: Triple) -> Result<Builder, LookupError> {
     match triple.architecture {
         Architecture::X86_64 => {
             isa_builder!(x64, (feature = "x86"), triple)
@@ -120,6 +126,103 @@ pub fn lookup(triple: Triple) -> Result<Builder, LookupError> {
             isa_builder!(pulley64, (feature = "pulley"), triple)
         }
         _ => Err(LookupError::Unsupported),
+    }
+}
+
+pub(crate) fn validate_v4_shared(triple: &Triple, flags: &settings::Flags) -> CodegenResult<()> {
+    if flags.v4_fence_rule_version() != 1 {
+        return Err(crate::CodegenError::Unsupported(alloc::format!(
+            "unsupported Spectre-v4 rule version {}",
+            flags.v4_fence_rule_version()
+        )));
+    }
+    if flags.v4_fence_policy() != settings::V4FencePolicy::Legacy
+        && !matches!(
+            triple.architecture,
+            Architecture::X86_64 | Architecture::Aarch64 { .. }
+        )
+    {
+        return Err(crate::CodegenError::Unsupported(alloc::format!(
+            "selective Spectre-v4 policy is unsupported on {}",
+            triple.architecture
+        )));
+    }
+    Ok(())
+}
+
+fn v4_checked_constructor(
+    triple: Triple,
+    flags: settings::Flags,
+    setup: &settings::Builder,
+) -> CodegenResult<OwnedTargetIsa> {
+    validate_v4_shared(&triple, &flags)?;
+    let selective = flags.v4_fence_policy() != settings::V4FencePolicy::Legacy;
+    let builder = lookup_unchecked(triple.clone()).map_err(|error| {
+        crate::CodegenError::Unsupported(alloc::format!("ISA lookup failed: {error}"))
+    })?;
+    let isa = (builder.constructor)(triple, flags, setup)?;
+    if selective {
+        let required = match isa.triple().architecture {
+            Architecture::X86_64 => ("x64_mitigation", "lfence"),
+            Architecture::Aarch64 { .. } => ("aarch64_mitigation", "ssbb"),
+            _ => unreachable!(),
+        };
+        if !isa
+            .isa_flags()
+            .iter()
+            .any(|flag| flag.name == required.0 && flag.value_string() == required.1)
+        {
+            return Err(crate::CodegenError::Unsupported(alloc::format!(
+                "selective v4_fence_policy requires {}={}",
+                required.0,
+                required.1
+            )));
+        }
+    }
+    Ok(isa)
+}
+
+#[cfg(test)]
+mod v4_policy_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_isa_and_rule_version_are_rejected_before_compilation() {
+        let mut builder = settings::builder();
+        builder.set("v4_fence_policy", "ranges").unwrap();
+        let flags = settings::Flags::new(builder);
+        assert!(validate_v4_shared(&triple!("riscv64"), &flags).is_err());
+        let mut builder = settings::builder();
+        builder.set("v4_fence_rule_version", "2").unwrap();
+        let flags = settings::Flags::new(builder);
+        assert!(validate_v4_shared(&triple!("x86_64"), &flags).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn x64_builder_rejects_selective_without_lfence() {
+        let mut shared = settings::builder();
+        shared.set("v4_fence_policy", "frame").unwrap();
+        let flags = settings::Flags::new(shared);
+        let mut builder = lookup(triple!("x86_64-unknown-linux-gnu")).unwrap();
+        assert!(builder.finish(flags.clone()).is_err());
+        builder.set("x64_mitigation", "lfence").unwrap();
+        assert!(builder.finish(flags).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "arm64")]
+    fn aarch64_builder_rejects_selective_without_ssbb() {
+        let mut shared = settings::builder();
+        shared.set("v4_fence_policy", "ranges_cfg").unwrap();
+        let flags = settings::Flags::new(shared);
+        let mut builder = lookup(triple!("aarch64-unknown-linux-gnu")).unwrap();
+        builder.set("has_lse", "true").unwrap();
+        assert!(builder.finish(flags.clone()).is_err());
+        builder.set("aarch64_mitigation", "cas_csdb").unwrap();
+        assert!(builder.finish(flags.clone()).is_err());
+        builder.set("aarch64_mitigation", "ssbb").unwrap();
+        assert!(builder.finish(flags).is_ok());
     }
 }
 

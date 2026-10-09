@@ -70,6 +70,28 @@ fn generate_inst_impls(f: &mut Formatter, insts: &[dsl::Inst]) {
         f.add_block("pub fn memory_access(&self) -> crate::MemoryAccess", |f| {
             match_variants(f, insts, "memory_access()");
         });
+        f.add_block(
+            "pub fn explicit_memory(&self) -> Option<crate::MemoryOperand<'_, R::ReadGpr>>",
+            |f| {
+                f.add_block("match self", |f| {
+                    for inst in insts {
+                        let name = inst.name();
+                        let generic = if inst.format.uses_register() {
+                            ""
+                        } else {
+                            "::<R>"
+                        };
+                        fmtln!(f, "Self::{name}(i) => i.explicit_memory{generic}(),");
+                    }
+                });
+            },
+        );
+        f.add_block("pub fn stack_access(&self) -> crate::StackAccess", |f| {
+            match_variants(f, insts, "stack_access()");
+        });
+        f.add_block("pub fn written_gprs(&self) -> alloc::vec::Vec<u8>", |f| {
+            match_variants(f, insts, "written_gprs()");
+        });
         f.add_block("pub fn encode(&self, b: &mut impl CodeSink)", |f| {
             match_variants(f, insts, "encode(b)");
         });

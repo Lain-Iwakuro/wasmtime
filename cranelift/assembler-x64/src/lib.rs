@@ -101,3 +101,36 @@ pub enum MemoryAccess {
     /// An explicit LFENCE.
     Fence,
 }
+
+/// An actual explicit memory operand, before register write effects are applied.
+/// `bytes` describes the memory operand, including narrow and scalar SIMD forms.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryOperand<'a, R: AsReg> {
+    /// The actual encoded effective address.
+    pub address: &'a Amode<R>,
+    /// Read, write, or possible read/write of this operand.
+    pub access: MemoryAccess,
+    /// Number of bytes touched, before any destination extension.
+    pub bytes: u16,
+}
+
+/// Implicit stack accesses, in addition to an instruction's explicit operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackAccess {
+    /// No implicit stack access.
+    None,
+    /// Store below the old RSP after decrementing it.
+    Push {
+        /// Number of bytes stored and subtracted from RSP.
+        bytes: u16,
+    },
+    /// Read at the old RSP before incrementing it.
+    Pop {
+        /// Number of bytes read and added to RSP.
+        bytes: u16,
+    },
+    /// Read the eight-byte return address at RSP.
+    Return,
+    /// Store the eight-byte return address and enter an opaque callee.
+    Call,
+}

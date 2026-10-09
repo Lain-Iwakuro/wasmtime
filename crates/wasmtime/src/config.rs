@@ -2640,6 +2640,22 @@ impl Config {
                 Some(target.clone())
             };
 
+        if self.compiler_config_mut().strategy == Some(Strategy::Winch)
+            && [
+                ("v4_fence_policy", "legacy"),
+                ("x64_mitigation", "none"),
+                ("aarch64_mitigation", "none"),
+            ]
+            .iter()
+            .any(|(name, disabled)| {
+                self.compiler_config_mut()
+                    .settings
+                    .get(*name)
+                    .is_some_and(|value| value.as_str() != *disabled)
+            })
+        {
+            bail!("experimental software mitigations require the Cranelift compiler");
+        }
         let mut compiler = match self.compiler_config_mut().strategy {
             #[cfg(feature = "cranelift")]
             Some(Strategy::Cranelift) => wasmtime_cranelift::builder(target_for_builder)?,

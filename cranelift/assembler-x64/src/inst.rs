@@ -60,3 +60,90 @@ include!(concat!(env!("OUT_DIR"), "/assembler.rs"));
 /// ```
 #[doc(inline)]
 pub use for_each_feature;
+
+#[cfg(test)]
+mod memory_metadata_tests {
+    use super::*;
+    use crate::{MemoryAccess, Registers, StackAccess};
+
+    struct Regs;
+    impl Registers for Regs {
+        type ReadGpr = u8;
+        type ReadWriteGpr = u8;
+        type WriteGpr = u8;
+        type ReadXmm = u8;
+        type ReadWriteXmm = u8;
+        type WriteXmm = u8;
+    }
+
+    fn memory() -> Amode<u8> {
+        Amode::ImmReg {
+            base: 7,
+            simm32: crate::AmodeOffsetPlusKnownOffset::ZERO,
+            trap: None,
+        }
+    }
+
+    #[test]
+    fn actual_memory_width_is_independent_of_result_width() {
+        let cases: [(Inst<Regs>, u16); 8] = [
+            (movzbq_rm::new(0, memory()).into(), 1),
+            (movswq_rm::new(0, memory()).into(), 2),
+            (addq_rm::new(0, memory()).into(), 8),
+            (cvtss2si_aq::new(0, memory()).into(), 4),
+            (movdqu_a::new(0, memory()).into(), 16),
+            (pextrb_a::new(memory(), 0, 0).into(), 1),
+            (pextrw_b::new(memory(), 0, 0).into(), 2),
+            (pinsrb_a::new(0, memory(), 0).into(), 1),
+        ];
+        for (inst, bytes) in cases {
+            let effect = inst.explicit_memory().unwrap();
+            assert_eq!(effect.bytes, bytes, "{inst}");
+            assert_eq!(*effect.address, memory());
+        }
+        assert!(
+            Inst::<Regs>::from(leaq_rm::new(0, memory()))
+                .explicit_memory()
+                .is_none()
+        );
+        assert!(
+            Inst::<Regs>::from(addq_rm::new(0, 7))
+                .explicit_memory()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn implicit_stack_and_rmw_effects_are_not_lost() {
+        let push: Inst<Regs> = pushq_m::new(memory()).into();
+        assert_eq!(push.stack_access(), StackAccess::Push { bytes: 8 });
+        assert_eq!(push.explicit_memory().unwrap().access, MemoryAccess::Read);
+        let pop: Inst<Regs> = popw_m::new(memory()).into();
+        assert_eq!(pop.stack_access(), StackAccess::Pop { bytes: 2 });
+        assert_eq!(pop.explicit_memory().unwrap().access, MemoryAccess::Write);
+        assert_eq!(
+            Inst::<Regs>::from(retq_zo::new()).stack_access(),
+            StackAccess::Return
+        );
+        let rmw: Inst<Regs> = lock_cmpxchgb_mr::new(memory(), 1, Fixed(0)).into();
+        let memory = rmw.explicit_memory().unwrap();
+        assert_eq!(memory.bytes, 1);
+        assert_eq!(memory.access, MemoryAccess::ReadWrite);
+        assert!(rmw.written_gprs().contains(&0));
+    }
+
+    #[test]
+    fn partial_register_writes_define_the_full_address_register() {
+        let byte: Inst<Regs> = movb_mr::new(7, 0).into();
+        let word: Inst<Regs> = movw_mr::new(7, 0).into();
+        let long: Inst<Regs> = movl_mr::new(7, 0).into();
+        let quad: Inst<Regs> = movq_mr::new(7, 0).into();
+        for inst in [byte, word, long, quad] {
+            assert_eq!(inst.written_gprs(), [7]);
+        }
+        assert_eq!(
+            Inst::<Regs>::from(pushq_o::new(7)).written_gprs(),
+            [gpr::enc::RSP]
+        );
+    }
+}
