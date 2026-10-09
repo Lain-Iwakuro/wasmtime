@@ -250,6 +250,138 @@ fn selective_policies_compile_after_register_allocation() {
     }
 }
 
+#[test]
+#[cfg(feature = "disas")]
+fn selective_cfg_layout_preserves_folded_empty_retry_edge() {
+    use crate::machinst::v4_fences::decoded_nonfence_stream;
+    let mut func = new_func(&[types::I64], &[types::I64]);
+    let (mut pos, values) = entry(&mut func, &[types::I64]);
+    let ptr = values[0];
+    let desired = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 8);
+    let retry = pos.func.dfg.make_block();
+    let failed = pos.func.dfg.make_block();
+    let done = pos.func.dfg.make_block();
+    pos.ins().jump(retry, no_args());
+    pos.insert_block(retry);
+    let expected = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
+    let old = pos
+        .ins()
+        .atomic_cas(MemFlags::trusted(), ptr, expected, desired);
+    let success = pos.ins().icmp(IntCC::Equal, old, expected);
+    pos.ins().brif(success, done, no_args(), failed, no_args());
+    pos.insert_block(failed);
+    pos.ins().jump(retry, no_args());
+    pos.insert_block(done);
+    pos.ins().return_(&[old]);
+    let cs = isa::lookup("x86_64-unknown-linux-gnu".parse().unwrap())
+        .unwrap()
+        .finish(settings::Flags::new(settings::builder()))
+        .unwrap()
+        .to_capstone()
+        .unwrap();
+    let reference = compile_policy(func.clone(), Some("lfence"), "ranges");
+    let optimized = compile_policy(func, Some("lfence"), "ranges_cfg");
+    assert_eq!(
+        decoded_nonfence_stream(&cs, &optimized, &[0x0f, 0xae, 0xe8]),
+        decoded_nonfence_stream(&cs, &reference, &[0x0f, 0xae, 0xe8]),
+        "an empty retry edge must remain eligible for native branch folding"
+    );
+}
+
+#[test]
+fn selective_cfg_layout_separator_rejects_zero_code_and_complex_tails() {
+    use super::*;
+    let ordinary = Inst::External {
+        inst: asm::inst::movq_mr::new(Amode::imm_reg(0, regs::rdi()), Gpr::RSI).into(),
+    };
+    assert!(ordinary.v4_emits_nonbranch_code());
+    for inst in [
+        Inst::Args { args: vec![] },
+        Inst::DummyUse { reg: regs::rdi() },
+        Inst::SequencePoint,
+        Inst::External {
+            inst: asm::inst::jmpq_m::new(Amode::imm_reg(0, regs::rdi())).into(),
+        },
+        Inst::External {
+            inst: asm::inst::callq_m::new(Amode::imm_reg(0, regs::rdi())).into(),
+        },
+        Inst::External {
+            inst: asm::inst::retq_zo::new().into(),
+        },
+        Inst::StackProbeLoop {
+            tmp: Writable::from_reg(regs::rax()),
+            frame_size: 8192,
+            guard_size: 4096,
+        },
+        Inst::AtomicRmwSeq {
+            ty: types::I8,
+            op: AtomicRmwSeqOp::Nand,
+            mem: SyntheticAmode::real(Amode::imm_reg(0, regs::rdi())),
+            operand: Gpr::RSI,
+            temp: Writable::from_reg(Gpr::RDX),
+            dst_old: Writable::from_reg(Gpr::RAX),
+        },
+    ] {
+        assert!(!inst.v4_emits_nonbranch_code(), "{inst:?}");
+    }
+}
+
+#[test]
+#[cfg(feature = "disas")]
+fn selective_cfg_layout_moves_guard_after_real_store() {
+    use crate::machinst::v4_fences::decoded_nonfence_stream;
+    let mut func = new_func(&[types::I64, types::I32], &[types::I64]);
+    let (mut pos, values) = entry(&mut func, &[types::I64, types::I32]);
+    let seed = pos
+        .ins()
+        .load(types::I64, MemFlags::trusted(), values[0], 16);
+    let dirty = pos.func.dfg.make_block();
+    let clean = pos.func.dfg.make_block();
+    let join = pos.func.dfg.make_block();
+    let condition = pos.ins().icmp_imm(IntCC::NotEqual, values[1], 0);
+    pos.ins()
+        .brif(condition, dirty, no_args(), clean, no_args());
+    pos.insert_block(dirty);
+    pos.ins().store(MemFlags::trusted(), seed, values[0], 0);
+    pos.ins().jump(join, no_args());
+    pos.insert_block(clean);
+    pos.ins().jump(join, no_args());
+    pos.insert_block(join);
+    let result = pos
+        .ins()
+        .load(types::I64, MemFlags::trusted(), values[0], 0);
+    pos.ins().return_(&[result]);
+    let cs = isa::lookup("x86_64-unknown-linux-gnu".parse().unwrap())
+        .unwrap()
+        .finish(settings::Flags::new(settings::builder()))
+        .unwrap()
+        .to_capstone()
+        .unwrap();
+    let reference = compile_policy(func.clone(), Some("lfence"), "ranges");
+    let optimized = compile_policy(func, Some("lfence"), "ranges_cfg");
+    assert_ne!(
+        optimized, reference,
+        "a store followed by a jump must allow CFG placement"
+    );
+    assert_eq!(
+        decoded_nonfence_stream(&cs, &optimized, &[0x0f, 0xae, 0xe8]),
+        decoded_nonfence_stream(&cs, &reference, &[0x0f, 0xae, 0xe8]),
+    );
+    let decoded = cs.disasm_all(&optimized, 0).unwrap();
+    assert!(
+        decoded.as_ref().windows(2).any(|pair| {
+            pair[0].mnemonic() == Some("movq")
+                && pair[0]
+                    .op_str()
+                    .unwrap()
+                    .split_once(',')
+                    .is_some_and(|(src, dst)| src.starts_with('%') && dst.contains('('))
+                && pair[1].bytes() == [0x0f, 0xae, 0xe8]
+        }),
+        "the moved guard must follow the actual store"
+    );
+}
+
 fn selective_native_plan(
     insts: &[super::Inst],
     policy: crate::machinst::v4_fences::V4Policy,

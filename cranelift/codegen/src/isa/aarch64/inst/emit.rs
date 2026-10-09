@@ -3817,6 +3817,43 @@ impl MachInstEmit for Inst {
         super::ssbb::classify_v4(self, frame, flags, context)
     }
 
+    fn v4_emits_nonbranch_code(&self) -> bool {
+        // These ordinary accesses end in the actual load/store instruction.
+        // Address helpers contain no branches. Keep all complex templates,
+        // probes, calls, and zero-code metadata outside this whitelist.
+        matches!(
+            self,
+            Inst::ULoad8 { .. }
+                | Inst::SLoad8 { .. }
+                | Inst::ULoad16 { .. }
+                | Inst::SLoad16 { .. }
+                | Inst::ULoad32 { .. }
+                | Inst::SLoad32 { .. }
+                | Inst::ULoad64 { .. }
+                | Inst::FpuLoad16 { .. }
+                | Inst::FpuLoad32 { .. }
+                | Inst::FpuLoad64 { .. }
+                | Inst::FpuLoad128 { .. }
+                | Inst::LoadP64 { .. }
+                | Inst::FpuLoadP64 { .. }
+                | Inst::FpuLoadP128 { .. }
+                | Inst::Store8 { .. }
+                | Inst::Store16 { .. }
+                | Inst::Store32 { .. }
+                | Inst::Store64 { .. }
+                | Inst::FpuStore16 { .. }
+                | Inst::FpuStore32 { .. }
+                | Inst::FpuStore64 { .. }
+                | Inst::FpuStore128 { .. }
+                | Inst::StoreP64 { .. }
+                | Inst::FpuStoreP64 { .. }
+                | Inst::FpuStoreP128 { .. }
+                | Inst::LoadAcquire { .. }
+                | Inst::StoreRelease { .. }
+                | Inst::VecLoadReplicate { .. }
+        )
+    }
+
     fn ssbb_veneer_barrier() -> Option<u32> {
         Some(super::ssbb::SSBB_ENCODING)
     }

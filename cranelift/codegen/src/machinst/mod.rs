@@ -392,6 +392,16 @@ pub trait MachInstEmit: MachInst {
         )))
     }
 
+    /// Prove that this instruction emits actual non-branch code at its tail.
+    ///
+    /// A selective CFG guard may follow this instruction before a terminator.
+    /// Zero-code instructions and complex expansions must return false unless
+    /// their exact emission has been audited for this layout property. Memory
+    /// effects alone do not prove it: an expansion can end in a branch.
+    fn v4_emits_nonbranch_code(&self) -> bool {
+        false
+    }
+
     /// Width of an inserted store-to-load barrier.
     fn ssbb_barrier_size() -> u32 {
         4

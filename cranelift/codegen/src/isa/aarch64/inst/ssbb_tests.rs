@@ -453,6 +453,124 @@ fn selective_native_codegen_moves_guard_and_keeps_nonfence_words() {
 }
 
 #[test]
+#[cfg(feature = "disas")]
+fn selective_cfg_layout_preserves_folded_empty_retry_edge() {
+    use crate::machinst::v4_fences::decoded_nonfence_stream;
+    let mut func = new_func(&[types::I64], &[types::I64]);
+    let (mut pos, values) = entry(&mut func, &[types::I64]);
+    let ptr = values[0];
+    let desired = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 8);
+    let retry = pos.func.dfg.make_block();
+    let failed = pos.func.dfg.make_block();
+    let done = pos.func.dfg.make_block();
+    pos.ins().jump(retry, no_args());
+    pos.insert_block(retry);
+    let expected = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
+    let old = pos
+        .ins()
+        .atomic_cas(MemFlags::trusted(), ptr, expected, desired);
+    let success = pos.ins().icmp(IntCC::Equal, old, expected);
+    pos.ins().brif(success, done, no_args(), failed, no_args());
+    pos.insert_block(failed);
+    pos.ins().jump(retry, no_args());
+    pos.insert_block(done);
+    pos.ins().return_(&[old]);
+    let cs = target("ssbb", true, false).to_capstone().unwrap();
+    let reference = compile_policy("ranges", func.clone());
+    let optimized = compile_policy("ranges_cfg", func);
+    assert_eq!(
+        decoded_nonfence_stream(&cs, &optimized.bytes, &SSBB.to_le_bytes()),
+        decoded_nonfence_stream(&cs, &reference.bytes, &SSBB.to_le_bytes()),
+        "an empty retry edge must remain eligible for native branch folding"
+    );
+}
+
+#[test]
+fn selective_cfg_layout_separator_rejects_zero_code_and_complex_tails() {
+    use crate::isa::aarch64::inst::*;
+    use crate::machinst::MachInstEmit;
+    let ordinary = Inst::Store64 {
+        rd: xreg(1),
+        mem: AMode::reg(xreg(0)),
+        flags: MemFlags::trusted(),
+    };
+    assert!(ordinary.v4_emits_nonbranch_code());
+    let paired = Inst::StoreP64 {
+        rt: xreg(1),
+        rt2: xreg(2),
+        mem: PairAMode::SignedOffset {
+            reg: xreg(0),
+            simm7: SImm7Scaled::maybe_from_i64(0, types::I64).unwrap(),
+        },
+        flags: MemFlags::trusted(),
+    };
+    assert!(paired.v4_emits_nonbranch_code());
+    for inst in [
+        Inst::Args { args: vec![] },
+        Inst::StackProbeLoop {
+            start: writable_xreg(0),
+            end: xreg(1),
+            step: Imm12::maybe_from_u64(4096).unwrap(),
+        },
+        Inst::AtomicRMW {
+            ty: types::I64,
+            op: AtomicRMWOp::Add,
+            rs: xreg(1),
+            rt: writable_xreg(2),
+            rn: xreg(0),
+            flags: MemFlags::trusted(),
+        },
+    ] {
+        assert!(!inst.v4_emits_nonbranch_code(), "{inst:?}");
+    }
+}
+
+#[test]
+#[cfg(feature = "disas")]
+fn selective_cfg_layout_moves_guard_after_real_store() {
+    use crate::machinst::v4_fences::decoded_nonfence_stream;
+    let mut func = new_func(&[types::I64, types::I32], &[types::I64]);
+    let (mut pos, values) = entry(&mut func, &[types::I64, types::I32]);
+    let seed = pos
+        .ins()
+        .load(types::I64, MemFlags::trusted(), values[0], 16);
+    let dirty = pos.func.dfg.make_block();
+    let clean = pos.func.dfg.make_block();
+    let join = pos.func.dfg.make_block();
+    let condition = pos.ins().icmp_imm(IntCC::NotEqual, values[1], 0);
+    pos.ins()
+        .brif(condition, dirty, no_args(), clean, no_args());
+    pos.insert_block(dirty);
+    pos.ins().store(MemFlags::trusted(), seed, values[0], 0);
+    pos.ins().jump(join, no_args());
+    pos.insert_block(clean);
+    pos.ins().jump(join, no_args());
+    pos.insert_block(join);
+    let result = pos
+        .ins()
+        .load(types::I64, MemFlags::trusted(), values[0], 0);
+    pos.ins().return_(&[result]);
+    let cs = target("ssbb", true, false).to_capstone().unwrap();
+    let reference = compile_policy("ranges", func.clone());
+    let optimized = compile_policy("ranges_cfg", func);
+    assert_ne!(
+        optimized.bytes, reference.bytes,
+        "a store followed by a jump must allow CFG placement"
+    );
+    assert_eq!(
+        decoded_nonfence_stream(&cs, &optimized.bytes, &SSBB.to_le_bytes()),
+        decoded_nonfence_stream(&cs, &reference.bytes, &SSBB.to_le_bytes()),
+    );
+    let decoded = cs.disasm_all(&optimized.bytes, 0).unwrap();
+    assert!(
+        decoded.as_ref().windows(2).any(|pair| {
+            pair[0].mnemonic() == Some("str") && pair[1].bytes() == SSBB.to_le_bytes()
+        }),
+        "the moved guard must follow the actual store"
+    );
+}
+
+#[test]
 fn selective_internal_templates_emit_exact_fixed_guard_count() {
     use crate::isa::aarch64::inst::*;
     use crate::machinst::v4_fences::{V4Context, V4Policy};

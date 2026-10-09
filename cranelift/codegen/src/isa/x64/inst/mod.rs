@@ -1615,6 +1615,16 @@ impl MachInstEmit for Inst {
         ssbb::classify_v4(self, frame, info, context)
     }
 
+    fn v4_emits_nonbranch_code(&self) -> bool {
+        // The assembler encodes exactly one ordinary memory instruction here.
+        // Indirect jumps also expose a memory operand; calls and returns have
+        // implicit stack effects. None of those are layout separators.
+        matches!(self, Inst::External { inst }
+            if inst.explicit_memory().is_some()
+                && inst.stack_access() == asm::StackAccess::None
+                && !matches!(inst, asm::Inst::jmpq_m(_)))
+    }
+
     fn ssbb_barrier_size() -> u32 {
         3
     }

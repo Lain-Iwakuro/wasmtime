@@ -1,5 +1,5 @@
 #![allow(missing_docs)]
-//! Final-machine-code Spectre-v4 events and independently checked fence plans.
+//! Postregalloc native memory effects and independently checked fence plans.
 
 use super::Reg;
 use super::ssbb::{SsbbMemStep, SsbbSeq};
@@ -223,7 +223,9 @@ pub struct V4Edge {
 pub struct V4Block {
     pub events: Vec<V4Node>,
     pub successors: Vec<V4Edge>,
-    /// Legal position immediately before a pure unconditional branch.
+    /// Backend-proven legal position before a pure unconditional branch.
+    /// The preceding original instruction must emit actual non-branch code,
+    /// so a guard cannot interrupt MachBuffer branch folding or threading.
     pub exit_site: Option<usize>,
     pub loop_depth: usize,
 }
@@ -976,6 +978,63 @@ fn plan_with_budget(
         moved,
         unknown_reasons: final_check.unknown_reasons,
     })
+}
+
+/// Decode the final emitted bytes for leaf regression fixtures without data pools.
+/// Only barriers, padding NOPs, and direct-branch displacements are normalized;
+/// branch predicates, branch counts, targets, and all other operands are retained.
+#[cfg(all(test, feature = "disas"))]
+pub(crate) fn decoded_nonfence_stream(
+    cs: &capstone::Capstone,
+    bytes: &[u8],
+    barrier: &[u8],
+) -> Vec<(alloc::string::String, alloc::string::String)> {
+    use alloc::string::ToString;
+    let instructions = cs.disasm_all(bytes, 0).unwrap();
+    assert_eq!(
+        instructions
+            .iter()
+            .map(|inst| inst.bytes().len())
+            .sum::<usize>(),
+        bytes.len(),
+        "fixture contains undecoded bytes"
+    );
+    let skip =
+        |inst: &capstone::Insn<'_>| inst.bytes() == barrier || inst.mnemonic() == Some("nop");
+    let mut positions = Vec::new();
+    let mut position = 0;
+    for inst in instructions.iter() {
+        positions.push((inst.address(), position));
+        if !skip(inst) {
+            position += 1;
+        }
+    }
+    positions.push((bytes.len() as u64, position));
+    instructions
+        .iter()
+        .filter(|inst| !skip(inst))
+        .map(|inst| {
+            let mnemonic = inst.mnemonic().unwrap().to_string();
+            let mut operands = inst.op_str().unwrap_or("").to_string();
+            let detail = cs.insn_detail(inst).unwrap();
+            let branch = detail.groups().iter().any(|group| {
+                u32::from(group.0) == capstone::InsnGroupType::CS_GRP_JUMP
+                    || u32::from(group.0) == capstone::InsnGroupType::CS_GRP_CALL
+            });
+            if branch {
+                if let Some(start) = operands.rfind("0x") {
+                    let target = u64::from_str_radix(&operands[start + 2..], 16).unwrap();
+                    let target = positions
+                        .iter()
+                        .find(|(address, _)| *address == target)
+                        .unwrap_or_else(|| panic!("unresolved native branch target: {operands}"))
+                        .1;
+                    operands.replace_range(start.., &format!("@{target}"));
+                }
+            }
+            (mnemonic, operands)
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1049,6 +1049,7 @@ impl<I: VCodeInst> VCode<I> {
                 let mut context = prologue_context.clone();
                 context.start_block(block_index as u32);
                 let mut exn_cut = None;
+                let mut previous_nonbranch = false;
                 if let Some(inst) = I::gen_block_start(
                     self.block_order.is_indirect_branch_target(block_id),
                     self.abi.is_forward_edge_cfi_enabled(),
@@ -1131,11 +1132,19 @@ impl<I: VCodeInst> VCode<I> {
                         }
                         let pure_branch = inst.is_term() == MachTerminator::Branch
                             && effects.events.iter().all(|event| *event == V4Event::Pure);
-                        if pure_branch {
+                        // A guard in an otherwise empty edge block prevents
+                        // MachBuffer from threading its jump or folding the
+                        // preceding conditional. Require a backend proof for
+                        // the immediately preceding original instruction;
+                        // earlier memory effects and zero-code metadata do
+                        // not prove that the branch tail is separated.
+                        if pure_branch && previous_nonbranch {
                             block.exit_site = Some(sites);
                         } else {
                             block.exit_site = None;
                         }
+                        previous_nonbranch = inst.is_term() == MachTerminator::None
+                            && inst.v4_emits_nonbranch_code();
                         add(
                             &inst,
                             effects,
@@ -1206,6 +1215,9 @@ impl<I: VCodeInst> VCode<I> {
         })
     }
 
+    /// Fingerprint the postregalloc MachInst stream and original CFG, before
+    /// MachBuffer branch folding and final layout. Final machine-code identity
+    /// needs an independent decoded assembly comparison as well.
     fn native_stream_digest(
         &mut self,
         regalloc: &regalloc2::Output,
