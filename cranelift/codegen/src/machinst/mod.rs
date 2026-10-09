@@ -363,7 +363,7 @@ pub trait MachInstEmit: MachInst {
     /// Pretty-print the instruction.
     fn pretty_print_inst(&self, state: &mut Self::State) -> String;
 
-    /// `aarch64_mitigation=ssbb` is selected. Other targets leave this false.
+    /// Store-to-load barrier insertion is enabled for this target.
     fn ssbb_enabled(_info: &Self::Info) -> bool {
         false
     }
@@ -373,13 +373,24 @@ pub trait MachInstEmit: MachInst {
         &self,
         _frame: &FrameLayout,
         _flags: &settings::Flags,
+        _info: &Self::Info,
     ) -> CodegenResult<ssbb::SsbbSeq> {
         Ok(ssbb::SsbbSeq::neutral())
     }
 
-    /// Encoding of `DSB #0` / SSBB. Zero when the target has no such barrier.
-    fn ssbb_barrier_word() -> u32 {
-        0
+    /// Width of an inserted store-to-load barrier.
+    fn ssbb_barrier_size() -> u32 {
+        4
+    }
+
+    /// Optional 4-byte prefix for load-bearing veneers (AArch64 only).
+    fn ssbb_veneer_barrier() -> Option<u32> {
+        None
+    }
+
+    /// The target emitter handles both ordinary and expanded instructions.
+    fn ssbb_handles_emission() -> bool {
+        false
     }
 
     /// Disassembly text for an inserted SSBB.

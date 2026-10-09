@@ -263,7 +263,11 @@ fn gen_descriptors(group: &SettingGroup, fmt: &mut Formatter) {
             fmt.add_block("detail::Descriptor", |fmt| {
                 fmtln!(fmt, "name: \"{}\",", preset.name);
                 fmtln!(fmt, "description: \"{}\",", preset.description);
-                fmtln!(fmt, "offset: {},", (idx as u8) * group.settings_size);
+                fmtln!(
+                    fmt,
+                    "offset: {},",
+                    (idx as u32) * u32::from(group.settings_size)
+                );
                 fmtln!(fmt, "detail: detail::Detail::Preset,");
             });
             fmtln!(fmt, ",");

@@ -4,6 +4,13 @@ use crate::cdsl::settings::SettingGroupBuilder;
 pub(crate) fn define() -> TargetIsa {
     let mut settings = SettingGroupBuilder::new("x86");
 
+    settings.add_enum(
+        "x64_mitigation",
+        "Experimental Spectre-v4 software mitigation.",
+        "none preserves code generation; lfence conservatively separates stores from later loads. Requires dispatch-serializing LFENCE on the executing CPU.",
+        vec!["none", "lfence"],
+    );
+
     // CPUID.01H:ECX
     let has_sse3 = settings.add_bool(
         "has_sse3",

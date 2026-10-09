@@ -26,6 +26,9 @@ mod emit_state;
 mod emit_tests;
 pub mod external;
 pub mod regs;
+mod ssbb;
+#[cfg(test)]
+mod ssbb_tests;
 mod stack_switch;
 pub mod unwind;
 
@@ -1587,6 +1590,29 @@ impl MachInstEmit for Inst {
 
     fn emit(&self, sink: &mut MachBuffer<Inst>, info: &Self::Info, state: &mut Self::State) {
         emit::emit(self, sink, info, state);
+    }
+
+    fn ssbb_enabled(info: &EmitInfo) -> bool {
+        info.isa_flags.x64_mitigation() == x64_settings::X64Mitigation::Lfence
+    }
+
+    fn ssbb_seq(
+        &self,
+        frame: &FrameLayout,
+        _flags: &settings::Flags,
+        info: &EmitInfo,
+    ) -> CodegenResult<crate::machinst::ssbb::SsbbSeq> {
+        ssbb::classify(self, frame, info)
+    }
+
+    fn ssbb_barrier_size() -> u32 {
+        3
+    }
+    fn ssbb_handles_emission() -> bool {
+        true
+    }
+    fn ssbb_mnemonic() -> &'static str {
+        "lfence"
     }
 
     fn pretty_print_inst(&self, _: &mut Self::State) -> String {

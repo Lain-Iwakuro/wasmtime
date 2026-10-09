@@ -67,6 +67,9 @@ fn generate_inst_display_impl(f: &mut Formatter, insts: &[dsl::Inst]) {
 
 fn generate_inst_impls(f: &mut Formatter, insts: &[dsl::Inst]) {
     f.add_block("impl<R: Registers> Inst<R>", |f| {
+        f.add_block("pub fn memory_access(&self) -> crate::MemoryAccess", |f| {
+            match_variants(f, insts, "memory_access()");
+        });
         f.add_block("pub fn encode(&self, b: &mut impl CodeSink)", |f| {
             match_variants(f, insts, "encode(b)");
         });

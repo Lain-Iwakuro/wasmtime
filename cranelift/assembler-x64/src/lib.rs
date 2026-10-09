@@ -83,3 +83,21 @@ pub use mem::{
 };
 pub use rex::RexPrefix;
 pub use xmm::Xmm;
+
+/// Architectural memory effects, including implicit stack accesses.
+/// Read/write means one indivisible instruction: a guard belongs before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryAccess {
+    /// No memory access (including LEA and NOP).
+    None,
+    /// Memory read, including folded operands and return addresses.
+    Read,
+    /// Memory write, including pushes.
+    Write,
+    /// Both a read and a possible write, including RMW and memory push/pop.
+    ReadWrite,
+    /// A call may read and write arbitrary memory.
+    Call,
+    /// An explicit LFENCE.
+    Fence,
+}

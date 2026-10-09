@@ -16,6 +16,13 @@ pub struct EmitState {
     /// A copy of the frame layout, used during the emission of `Inst::ReturnCallKnown` and
     /// `Inst::ReturnCallUnknown` instructions and exception callsites.
     pub frame_layout: FrameLayout,
+
+    ssbb_active: bool,
+    ssbb_dirty: bool,
+    ssbb_barriers: u32,
+    // An outer expansion already accounted for all effects; recursive emits
+    // must not account for them a second time.
+    pub(crate) ssbb_suppressed: bool,
 }
 
 impl MachInstEmitState<Inst> for EmitState {
@@ -24,7 +31,34 @@ impl MachInstEmitState<Inst> for EmitState {
             user_stack_map: None,
             ctrl_plane,
             frame_layout: abi.frame_layout().clone(),
+            ..Self::default()
         }
+    }
+
+    fn ssbb_install(&mut self, _block_in: &[bool]) {
+        self.ssbb_active = true;
+    }
+    fn ssbb_active(&self) -> bool {
+        self.ssbb_active
+    }
+    fn ssbb_set_dirty(&mut self, dirty: bool) {
+        if self.ssbb_active {
+            self.ssbb_dirty = dirty;
+        }
+    }
+    fn ssbb_dirty(&self) -> bool {
+        self.ssbb_active && self.ssbb_dirty
+    }
+    fn ssbb_reset_barrier_count(&mut self) {
+        self.ssbb_barriers = 0;
+    }
+    fn ssbb_barrier_count(&self) -> u32 {
+        self.ssbb_barriers
+    }
+    fn ssbb_emit_barrier(&mut self, sink: &mut MachBuffer<Inst>, _info: &EmitInfo) {
+        sink.put_data(&[0x0f, 0xae, 0xe8]);
+        self.ssbb_dirty = false;
+        self.ssbb_barriers += 1;
     }
 
     fn pre_safepoint(&mut self, user_stack_map: Option<ir::UserStackMap>) {
@@ -45,6 +79,21 @@ impl MachInstEmitState<Inst> for EmitState {
 }
 
 impl EmitState {
+    pub(crate) fn ssbb_step(
+        &mut self,
+        step: crate::machinst::ssbb::SsbbMemStep,
+        sink: &mut MachBuffer<Inst>,
+        info: &EmitInfo,
+    ) {
+        use crate::machinst::ssbb::SsbbSeq;
+        if self.ssbb_active && !self.ssbb_suppressed {
+            if SsbbSeq::needs_guard(self.ssbb_dirty, step) {
+                self.ssbb_emit_barrier(sink, info);
+            }
+            self.ssbb_dirty = SsbbSeq::transfer(self.ssbb_dirty, &[step]);
+        }
+    }
+
     pub(crate) fn take_stack_map(&mut self) -> Option<ir::UserStackMap> {
         self.user_stack_map.take()
     }

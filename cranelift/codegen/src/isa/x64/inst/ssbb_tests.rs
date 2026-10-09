@@ -1,0 +1,611 @@
+//! End-to-end regressions for the experimental store-to-load LFENCE policy.
+use crate::Context;
+use crate::cursor::{Cursor, FuncCursor};
+use crate::ir::condcodes::IntCC;
+use crate::ir::{
+    AbiParam, BlockArg, ExtFuncData, ExternalName, FuncRef, Function, InstBuilder, MemFlags,
+    Signature, Type, UserExternalName, UserFuncName, Value, types,
+};
+use crate::isa::{self, CallConv};
+use crate::settings::{self, Configurable};
+use alloc::vec::Vec;
+use cranelift_control::ControlPlane;
+
+fn compile(func: Function, mode: Option<&str>) -> Vec<u8> {
+    let mut shared = settings::builder();
+    shared.set("opt_level", "none").unwrap();
+    let mut builder = isa::lookup("x86_64-unknown-linux-gnu".parse().unwrap()).unwrap();
+    if let Some(mode) = mode {
+        builder.set("x64_mitigation", mode).unwrap();
+    }
+    let isa = builder.finish(settings::Flags::new(shared)).unwrap();
+    let mut ctx = Context::for_function(func);
+    ctx.compile(&*isa, &mut ControlPlane::default())
+        .unwrap()
+        .buffer
+        .data()
+        .to_vec()
+}
+
+fn store_load() -> Function {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params
+        .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+    sig.returns.push(AbiParam::new(types::I64));
+    let mut f = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+    let block = f.dfg.make_block();
+    let ptr = f.dfg.append_block_param(block, types::I64);
+    let val = f.dfg.append_block_param(block, types::I64);
+    let mut pos = FuncCursor::new(&mut f);
+    pos.insert_block(block);
+    pos.ins().store(MemFlags::trusted(), val, ptr, 0);
+    pos.ins().store(MemFlags::trusted(), val, ptr, 8);
+    let a = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
+    let b = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 8);
+    let sum = pos.ins().iadd(a, b);
+    pos.ins().return_(&[sum]);
+    f
+}
+
+fn fences(bytes: &[u8]) -> usize {
+    bytes
+        .windows(3)
+        .filter(|b| *b == [0x0f, 0xae, 0xe8])
+        .count()
+}
+
+#[test]
+fn lfence_coalesces_store_store_load_load() {
+    let bytes = compile(store_load(), Some("lfence"));
+    assert_eq!(fences(&bytes), 1, "{bytes:02x?}");
+}
+
+#[test]
+fn lfence_none_matches_default() {
+    let default = compile(store_load(), None);
+    let none = compile(store_load(), Some("none"));
+    assert_eq!(default, none);
+    assert_eq!(fences(&none), 0);
+}
+
+#[test]
+fn lfence_folded_load_and_lea_do_not_lose_store_state() {
+    use super::*;
+    let flags = settings::Flags::new(settings::builder());
+    let info = EmitInfo::new(
+        flags,
+        crate::isa::x64::settings::Flags::new(
+            &settings::Flags::new(settings::builder()),
+            &crate::isa::x64::settings::builder(),
+        ),
+    );
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.ssbb_set_dirty(false);
+    let mut sink = MachBuffer::<Inst>::new();
+    let rax = Writable::from_reg(Gpr::RAX);
+    let memory = || Amode::imm_reg(0, regs::rdi());
+    for inst in [
+        asm::inst::movq_mr::new(memory(), Gpr::RSI).into(),
+        asm::inst::leaq_rm::new(rax, memory()).into(),
+        asm::inst::addq_rm::new(rax, memory()).into(),
+        asm::inst::movq_rm::new(rax, memory()).into(),
+    ] {
+        Inst::External { inst }.emit(&mut sink, &info, &mut state);
+    }
+    let bytes = sink
+        .finish(&Default::default(), &mut ControlPlane::default())
+        .data()
+        .to_vec();
+    assert_eq!(
+        bytes,
+        [
+            0x48, 0x89, 0x37, 0x48, 0x8d, 0x07, 0x0f, 0xae, 0xe8, 0x48, 0x03, 0x07, 0x48, 0x8b,
+            0x07
+        ]
+    );
+}
+
+fn new_func(params: &[Type], returns: &[Type]) -> Function {
+    let mut sig = Signature::new(CallConv::SystemV);
+    for ty in params {
+        sig.params.push(AbiParam::new(*ty));
+    }
+    for ty in returns {
+        sig.returns.push(AbiParam::new(*ty));
+    }
+    Function::with_name_signature(UserFuncName::user(0, 0), sig)
+}
+
+fn entry<'a>(func: &'a mut Function, params: &[Type]) -> (FuncCursor<'a>, Vec<Value>) {
+    let block = func.dfg.make_block();
+    let mut values = Vec::new();
+    for ty in params {
+        values.push(func.dfg.append_block_param(block, *ty));
+    }
+    let mut pos = FuncCursor::new(func);
+    pos.insert_block(block);
+    (pos, values)
+}
+
+fn no_args() -> &'static [BlockArg] {
+    &[]
+}
+
+fn import_func(func: &mut Function, sig: Signature) -> FuncRef {
+    let signature = func.import_signature(sig);
+    let name = func.declare_imported_user_function(UserExternalName::new(0, 0));
+    func.import_function(ExtFuncData {
+        name: ExternalName::user(name),
+        signature,
+        colocated: true,
+        patchable: false,
+    })
+}
+
+#[test]
+fn lfence_join_and_loop_back_edge() {
+    let mut func = new_func(&[types::I64, types::I32], &[types::I64]);
+    let b0 = func.dfg.make_block();
+    let ptr = func.dfg.append_block_param(b0, types::I64);
+    let flag = func.dfg.append_block_param(b0, types::I32);
+    let b_store = func.dfg.make_block();
+    let b_clear = func.dfg.make_block();
+    let b_join = func.dfg.make_block();
+    {
+        let mut pos = FuncCursor::new(&mut func);
+        pos.insert_block(b0);
+        let cleared = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
+        let cond = pos.ins().icmp_imm(IntCC::NotEqual, flag, 0);
+        pos.ins().brif(cond, b_store, no_args(), b_clear, no_args());
+        pos.insert_block(b_store);
+        pos.ins().store(MemFlags::trusted(), cleared, ptr, 0);
+        pos.ins().jump(b_join, no_args());
+        pos.insert_block(b_clear);
+        pos.ins().jump(b_join, no_args());
+        pos.insert_block(b_join);
+        let joined = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 8);
+        pos.ins().return_(&[joined]);
+    }
+    let join = compile(func, Some("lfence"));
+    assert_eq!(fences(&join), 2);
+
+    let mut func = new_func(&[types::I64, types::I32], &[types::I64]);
+    let b0 = func.dfg.make_block();
+    let ptr = func.dfg.append_block_param(b0, types::I64);
+    let flag = func.dfg.append_block_param(b0, types::I32);
+    let b_loop = func.dfg.make_block();
+    let b_exit = func.dfg.make_block();
+    {
+        let mut pos = FuncCursor::new(&mut func);
+        pos.insert_block(b0);
+        let cleared = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 0);
+        let cond = pos.ins().icmp_imm(IntCC::Equal, flag, 0);
+        pos.ins().brif(cond, b_exit, no_args(), b_loop, no_args());
+        pos.insert_block(b_loop);
+        let next = pos.ins().load(types::I64, MemFlags::trusted(), ptr, 8);
+        pos.ins().store(MemFlags::trusted(), next, ptr, 0);
+        pos.ins().jump(b_loop, no_args());
+        pos.insert_block(b_exit);
+        pos.ins().return_(&[cleared]);
+    }
+    let looped = compile(func, Some("lfence"));
+    assert_eq!(fences(&looped), 2);
+}
+
+fn raw_info() -> super::EmitInfo {
+    let mut shared = settings::builder();
+    shared.set("preserve_frame_pointers", "true").unwrap();
+    let flags = settings::Flags::new(shared);
+    let mut isa_flags = crate::isa::x64::settings::builder();
+    isa_flags.set("has_cmpxchg16b", "true").unwrap();
+    let isa_flags = crate::isa::x64::settings::Flags::new(&flags, &isa_flags);
+    super::EmitInfo::new(flags, isa_flags)
+}
+
+fn emit_raw(insts: &[super::Inst], dirty: bool) -> Vec<u8> {
+    use super::*;
+    let info = raw_info();
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.ssbb_set_dirty(dirty);
+    let mut sink = MachBuffer::<Inst>::new();
+    for inst in insts {
+        inst.emit(&mut sink, &info, &mut state);
+    }
+    sink.finish(&Default::default(), &mut ControlPlane::default())
+        .data()
+        .to_vec()
+}
+
+#[test]
+fn lfence_implicit_stack_accesses_and_explicit_fence() {
+    use super::*;
+    let insts = [
+        Inst::External {
+            inst: asm::inst::pushq_o::new(Gpr::RBP).into(),
+        },
+        Inst::External {
+            inst: asm::inst::popq_o::new(Writable::from_reg(Gpr::RBP)).into(),
+        },
+        Inst::External {
+            inst: asm::inst::retq_zo::new().into(),
+        },
+    ];
+    assert_eq!(
+        emit_raw(&insts, false),
+        [0x55, 0x0f, 0xae, 0xe8, 0x5d, 0xc3]
+    );
+    let insts = [
+        Inst::External {
+            inst: asm::inst::pushq_o::new(Gpr::RBP).into(),
+        },
+        Inst::External {
+            inst: asm::inst::lfence_zo::new().into(),
+        },
+        Inst::External {
+            inst: asm::inst::popq_o::new(Writable::from_reg(Gpr::RBP)).into(),
+        },
+    ];
+    assert_eq!(emit_raw(&insts, true), [0x55, 0x0f, 0xae, 0xe8, 0x5d]);
+}
+
+#[test]
+fn lfence_atomic_retry_targets_guard_and_post_atomic_load_is_guarded() {
+    use super::*;
+    let insts = [
+        Inst::AtomicRmwSeq {
+            ty: types::I64,
+            op: AtomicRmwSeqOp::Nand,
+            mem: SyntheticAmode::real(Amode::imm_reg(0, regs::rdi())),
+            operand: Gpr::RSI,
+            temp: Writable::from_reg(Gpr::RDX),
+            dst_old: Writable::from_reg(Gpr::RAX),
+        },
+        Inst::External {
+            inst: asm::inst::movq_rm::new(
+                Writable::from_reg(Gpr::RAX),
+                Amode::imm_reg(8, regs::rdi()),
+            )
+            .into(),
+        },
+    ];
+    let bytes = emit_raw(&insts, false);
+    assert_eq!(fences(&bytes), 2, "{bytes:02x?}");
+    let cas = bytes
+        .windows(4)
+        .position(|b| b == [0xf0, 0x48, 0x0f, 0xb1])
+        .unwrap();
+    assert_eq!(&bytes[cas - 3..cas], &[0x0f, 0xae, 0xe8]);
+    let branch = bytes.windows(2).position(|b| b == [0x0f, 0x85]).unwrap();
+    let disp = i32::from_le_bytes(bytes[branch + 2..branch + 6].try_into().unwrap());
+    let target = (branch as i32 + 6 + disp) as usize;
+    assert!(target <= cas - 3, "retry skipped fence: {bytes:02x?}");
+    assert_eq!(target, 3, "retry should follow initial MOV: {bytes:02x?}");
+    assert_eq!(&bytes[branch + 6..branch + 9], &[0x0f, 0xae, 0xe8]);
+}
+
+#[test]
+fn lfence_patchable_call_offsets_exclude_guard() {
+    use super::*;
+    let info = raw_info();
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.ssbb_set_dirty(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    let call = Inst::CallKnown {
+        info: Box::new(CallInfo {
+            dest: ExternalName::LibCall(LibCall::Memcpy),
+            uses: smallvec![],
+            defs: smallvec![],
+            clobbers: Default::default(),
+            callee_conv: CallConv::SystemV,
+            caller_conv: CallConv::SystemV,
+            callee_pop_size: 0,
+            try_call_info: None,
+            patchable: true,
+        }),
+    };
+    state.pre_safepoint(Some(crate::ir::UserStackMap::new(&[], &Default::default())));
+    call.emit(&mut sink, &info, &mut state);
+    let code = sink.finish(&Default::default(), &mut ControlPlane::default());
+    assert_eq!(code.data(), [0x0f, 0xae, 0xe8, 0xe8, 0, 0, 0, 0]);
+    assert_eq!(code.relocs()[0].offset, 4);
+    assert_eq!(code.user_stack_maps()[0].0, 8);
+    assert_eq!(code.call_sites().next().unwrap().ret_addr, 8);
+    let patch = code.patchable_call_sites().next().unwrap();
+    assert_eq!((patch.ret_addr, patch.len), (8, 5));
+}
+
+#[test]
+fn lfence_call_stack_returns_are_guarded_inside_expansion() {
+    use super::*;
+    let call = Inst::CallUnknown {
+        info: Box::new(CallInfo {
+            dest: RegMem::Reg { reg: regs::rax() },
+            uses: smallvec![],
+            defs: smallvec![CallRetPair {
+                vreg: Writable::from_reg(regs::rdx()),
+                location: RetLocation::Stack(StackAMode::Slot(0), types::I64),
+            }],
+            clobbers: Default::default(),
+            callee_conv: CallConv::SystemV,
+            caller_conv: CallConv::SystemV,
+            callee_pop_size: 0,
+            try_call_info: None,
+            patchable: false,
+        }),
+    };
+    let bytes = emit_raw(&[call], true);
+    assert_eq!(
+        bytes,
+        [
+            0x0f, 0xae, 0xe8, 0xff, 0xd0, 0x0f, 0xae, 0xe8, 0x48, 0x8b, 0x14, 0x24
+        ]
+    );
+}
+
+#[test]
+fn lfence_call_and_regalloc_spills_compile() {
+    let mut func = new_func(&[types::I64], &[types::I64]);
+    let (mut pos, vals) = entry(&mut func, &[types::I64]);
+    let callee = import_func(pos.func, Signature::new(CallConv::SystemV));
+    let mut live = Vec::new();
+    for i in 0..32 {
+        live.push(
+            pos.ins()
+                .load(types::I64, MemFlags::trusted(), vals[0], i * 8),
+        );
+    }
+    pos.ins().call(callee, &[]);
+    let mut acc = live[0];
+    for v in live.into_iter().skip(1) {
+        acc = pos.ins().iadd(acc, v);
+    }
+    pos.ins().return_(&[acc]);
+    let bytes = compile(func, Some("lfence"));
+    assert!(
+        fences(&bytes) >= 3,
+        "entry, store/load spills, and post-call reload must be guarded: {bytes:02x?}"
+    );
+}
+
+#[test]
+fn lfence_presets_do_not_overflow_or_change_mode() {
+    let flags = settings::Flags::new(settings::builder());
+    let mut builder = crate::isa::x64::settings::builder();
+    builder.set("x64_mitigation", "lfence").unwrap();
+    for preset in ["znver4", "x86-64-v4"] {
+        builder.enable(preset).unwrap();
+        let flags = crate::isa::x64::settings::Flags::new(&flags, &builder);
+        assert_eq!(
+            flags.x64_mitigation(),
+            crate::isa::x64::settings::X64Mitigation::Lfence
+        );
+        assert!(flags.has_avx512f());
+    }
+}
+
+#[test]
+fn lfence_tail_call_argument_move_guards_final_jump() {
+    use super::*;
+    let info = raw_info();
+    let mut state = EmitState::default();
+    state.frame_layout.tail_args_size = 16;
+    state.ssbb_install(&[]);
+    state.ssbb_set_dirty(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    let inst = Inst::ReturnCallKnown {
+        info: Box::new(ReturnCallInfo {
+            dest: ExternalName::LibCall(LibCall::Memcpy),
+            new_stack_arg_size: 0,
+            uses: smallvec![],
+            tmp: Writable::from_reg(Gpr::R11),
+        }),
+    };
+    inst.emit(&mut sink, &info, &mut state);
+    let code = sink.finish(&Default::default(), &mut ControlPlane::default());
+    let bytes = code.data();
+    assert_eq!(fences(bytes), 2, "{bytes:02x?}");
+    assert_eq!(
+        &bytes[bytes.len() - 8..bytes.len() - 4],
+        &[0x0f, 0xae, 0xe8, 0xe9]
+    );
+    assert_eq!(code.relocs()[0].offset as usize, bytes.len() - 4);
+}
+
+#[test]
+fn lfence_tls_templates_keep_linker_bytes_contiguous() {
+    use super::*;
+    let symbol = ExternalName::LibCall(LibCall::ElfTlsGetAddr);
+    let elf = Inst::ElfTlsGetAddr {
+        symbol: symbol.clone(),
+        dst: Writable::from_reg(Gpr::RAX),
+    };
+    let bytes = emit_raw(&[elf], true);
+    assert_eq!(
+        bytes,
+        [
+            0x0f, 0xae, 0xe8, 0x66, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x66, 0x66, 0x48, 0xe8, 0, 0, 0,
+            0
+        ]
+    );
+    for inst in [
+        Inst::MachOTlsGetAddr {
+            symbol: symbol.clone(),
+            dst: Writable::from_reg(Gpr::RAX),
+        },
+        Inst::CoffTlsGetAddr {
+            symbol,
+            dst: Writable::from_reg(Gpr::RAX),
+            tmp: Writable::from_reg(Gpr::RCX),
+        },
+    ] {
+        let bytes = emit_raw(&[inst], true);
+        assert_eq!(fences(&bytes), 1, "{bytes:02x?}");
+        assert_eq!(&bytes[..3], &[0x0f, 0xae, 0xe8]);
+    }
+}
+
+#[test]
+fn lfence_fault_metadata_points_at_load_after_guard() {
+    use super::*;
+    let info = raw_info();
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.ssbb_set_dirty(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    let inst = Inst::External {
+        inst: asm::inst::movq_rm::new(
+            Writable::from_reg(Gpr::RAX),
+            Amode::imm_reg(0, regs::rdi()).with_flags(MemFlags::new()),
+        )
+        .into(),
+    };
+    inst.emit(&mut sink, &info, &mut state);
+    let code = sink.finish(&Default::default(), &mut ControlPlane::default());
+    assert_eq!(code.data(), [0x0f, 0xae, 0xe8, 0x48, 0x8b, 0x07]);
+    assert_eq!(code.traps()[0].offset, 3);
+}
+
+#[test]
+fn lfence_unsupported_internal_control_flow_fails_closed() {
+    use super::*;
+    let info = raw_info();
+    for inst in [
+        Inst::WinchJmpIf {
+            cc: CC::Z,
+            taken: MachLabel::from_block(crate::machinst::BlockIndex::new(0)),
+        },
+        Inst::StackSwitchBasic {
+            store_context_ptr: Gpr::RAX,
+            load_context_ptr: Gpr::RBX,
+            in_payload0: Gpr::RCX,
+            out_payload0: Writable::from_reg(Gpr::RDX),
+        },
+    ] {
+        assert!(matches!(
+            super::ssbb::classify(&inst, &Default::default(), &info),
+            Err(crate::CodegenError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn lfence_atomic128_rmw_and_exchange_retry_include_guard() {
+    use super::*;
+    use crate::isa::x64::lower::isle::generated_code::Atomic128RmwSeqOp;
+    let memory = || SyntheticAmode::real(Amode::imm_reg(0, regs::rdi()));
+    let low = Writable::from_reg(Gpr::RAX);
+    let high = Writable::from_reg(Gpr::RDX);
+    for atomic in [
+        Inst::Atomic128XchgSeq {
+            mem: memory(),
+            operand_low: Gpr::RBX,
+            operand_high: Gpr::RCX,
+            dst_old_low: low,
+            dst_old_high: high,
+        },
+        Inst::Atomic128RmwSeq {
+            mem: Box::new(memory()),
+            op: Atomic128RmwSeqOp::Add,
+            operand_low: Gpr::RSI,
+            operand_high: Gpr::R8,
+            temp_low: Writable::from_reg(Gpr::RBX),
+            temp_high: Writable::from_reg(Gpr::RCX),
+            dst_old_low: low,
+            dst_old_high: high,
+        },
+    ] {
+        let load = Inst::External {
+            inst: asm::inst::movq_rm::new(low, Amode::imm_reg(0, regs::rdi())).into(),
+        };
+        let bytes = emit_raw(&[atomic, load], false);
+        assert_eq!(fences(&bytes), 2, "{bytes:02x?}");
+        let cas = bytes
+            .windows(4)
+            .position(|b| b == [0xf0, 0x48, 0x0f, 0xc7])
+            .unwrap();
+        assert_eq!(&bytes[cas - 3..cas], &[0x0f, 0xae, 0xe8]);
+        let branch = bytes.windows(2).position(|b| b == [0x0f, 0x85]).unwrap();
+        let disp = i32::from_le_bytes(bytes[branch + 2..branch + 6].try_into().unwrap());
+        let target = (branch as i32 + 6 + disp) as usize;
+        assert_eq!(
+            target, 7,
+            "retry follows the two initial loads: {bytes:02x?}"
+        );
+        assert!(target <= cas - 3, "retry skipped fence: {bytes:02x?}");
+        assert_eq!(&bytes[branch + 6..branch + 9], &[0x0f, 0xae, 0xe8]);
+    }
+}
+
+#[test]
+fn lfence_try_call_exception_state_precedes_return_load_and_offsets_are_valid() {
+    use super::*;
+    use crate::machinst::ssbb::{SsbbMemStep, SsbbSeq};
+    let info = raw_info();
+    let mut state = EmitState::default();
+    state.ssbb_install(&[]);
+    state.ssbb_set_dirty(true);
+    let mut sink = MachBuffer::<Inst>::new();
+    let continuation = sink.get_label();
+    let handler = sink.get_label();
+    let inst = Inst::CallKnown {
+        info: Box::new(CallInfo {
+            dest: ExternalName::LibCall(LibCall::Memcpy),
+            uses: smallvec![],
+            defs: smallvec![CallRetPair {
+                vreg: Writable::from_reg(regs::rdx()),
+                location: RetLocation::Stack(StackAMode::Slot(0), types::I64)
+            }],
+            clobbers: Default::default(),
+            callee_conv: CallConv::SystemV,
+            caller_conv: CallConv::SystemV,
+            callee_pop_size: 0,
+            try_call_info: Some(TryCallInfo {
+                continuation,
+                exception_handlers: vec![TryCallHandler::Default(handler)].into_boxed_slice(),
+            }),
+            patchable: false,
+        }),
+    };
+    let seq = super::ssbb::classify(&inst, state.frame_layout(), &info).unwrap();
+    assert_eq!(
+        seq.steps.as_slice(),
+        &[SsbbMemStep::Call, SsbbMemStep::Load]
+    );
+    assert_eq!(seq.exn_cut, Some(0));
+    assert!(SsbbSeq::transfer(
+        false,
+        &seq.steps[..=seq.exn_cut.unwrap() as usize]
+    ));
+    assert!(!SsbbSeq::transfer(false, &seq.steps));
+    inst.emit(&mut sink, &info, &mut state);
+    sink.bind_label(handler, state.ctrl_plane_mut());
+    let handler_offset = sink.cur_offset();
+    state.ssbb_set_dirty(true);
+    Inst::External {
+        inst: asm::inst::retq_zo::new().into(),
+    }
+    .emit(&mut sink, &info, &mut state);
+    sink.bind_label(continuation, state.ctrl_plane_mut());
+    state.ssbb_set_dirty(false);
+    Inst::External {
+        inst: asm::inst::retq_zo::new().into(),
+    }
+    .emit(&mut sink, &info, &mut state);
+    let code = sink.finish(&Default::default(), &mut ControlPlane::default());
+    let call = code.call_sites().next().unwrap();
+    assert_eq!(call.ret_addr, 8);
+    assert_eq!(
+        call.exception_handlers,
+        &[crate::machinst::FinalizedMachExceptionHandler::Default(
+            handler_offset
+        )]
+    );
+    assert_eq!(
+        &code.data()[handler_offset as usize..handler_offset as usize + 4],
+        &[0x0f, 0xae, 0xe8, 0xc3]
+    );
+    assert_eq!(fences(code.data()), 3);
+}

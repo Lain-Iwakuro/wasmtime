@@ -57,6 +57,8 @@ impl dsl::Inst {
         let impl_block = self.generate_impl_block_start();
         let struct_name = self.struct_name_with_generic();
         f.add_block(&format!("{impl_block} {struct_name}"), |f| {
+            self.generate_memory_access_function(f);
+            f.empty_line();
             self.generate_new_function(f);
             f.empty_line();
             self.generate_mnemonic_function(f);
@@ -70,6 +72,65 @@ impl dsl::Inst {
             self.generate_features_function(f);
             f.empty_line();
             self.generate_num_registers_function(f);
+        });
+    }
+
+    /// Generate memory effects from operand mutability, with the complete set
+    /// of implicit-memory/address-only exceptions in the current instruction DSL.
+    fn generate_memory_access_function(&self, f: &mut Formatter) {
+        use dsl::OperandKind::*;
+        f.add_block("pub fn memory_access(&self) -> crate::MemoryAccess", |f| {
+            let special = match self.mnemonic.as_str() {
+                "leaw" | "leal" | "leaq" | "nop" | "nopl" => Some("None"),
+                "callq" => Some("Call"),
+                "retq" => Some("Read"),
+                "lfence" => Some("Fence"),
+                _ => None,
+            };
+            if let Some(special) = special {
+                fmtln!(f, "crate::MemoryAccess::{special}");
+                return;
+            }
+            let mut reads = Vec::new();
+            let mut writes = Vec::new();
+            match self.mnemonic.as_str() {
+                "pushw" | "pushq" => writes.push("true".to_string()),
+                "popw" | "popq" => reads.push("true".to_string()),
+                _ => {}
+            }
+            for operand in &self.format.operands {
+                let loc = operand.location;
+                let condition = match loc.kind() {
+                    Mem(_) => "true".to_string(),
+                    RegMem(_) => {
+                        let class = loc.reg_class().unwrap();
+                        format!("matches!(&self.{loc}, {class}Mem::Mem(_))")
+                    }
+                    FixedReg(_) | Reg(_) | Imm(_) => continue,
+                };
+                if operand.mutability.is_read() {
+                    reads.push(condition.clone());
+                }
+                if operand.mutability.is_write() {
+                    writes.push(condition);
+                }
+            }
+            let reads = if reads.is_empty() {
+                "false".to_string()
+            } else {
+                reads.join(" || ")
+            };
+            let writes = if writes.is_empty() {
+                "false".to_string()
+            } else {
+                writes.join(" || ")
+            };
+            f.add_block(&format!("match ({reads}, {writes})"), |f| {
+                fmtln!(f, "(false, false) => crate::MemoryAccess::None,");
+                fmtln!(f, "(true, false) => crate::MemoryAccess::Read,");
+                fmtln!(f, "(false, true) => crate::MemoryAccess::Write,");
+                fmtln!(f, "(true, true) => crate::MemoryAccess::ReadWrite,");
+            });
         });
     }
 

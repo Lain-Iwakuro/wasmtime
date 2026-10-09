@@ -777,12 +777,12 @@ impl<I: VCodeInst> VCode<I> {
     ) -> CodegenResult<SsbbPlan> {
         let n = self.num_blocks();
         let frame = self.abi.frame_layout().clone();
-        let classify = |inst: &I| I::ssbb_seq(inst, &frame, flags);
+        let classify = |inst: &I| I::ssbb_seq(inst, &frame, flags, &self.emit_info);
 
         let mut prologue_steps = SmallVec::<[_; 16]>::new();
         for inst in self.abi.gen_prologue() {
             let seq = classify(&inst)?;
-            if seq.needs_internal() {
+            if seq.needs_internal() && !I::ssbb_handles_emission() {
                 return Err(CodegenError::Unsupported(format!(
                     "aarch64_mitigation=ssbb: prologue instruction has an internal store-to-load: {inst:?}"
                 )));
@@ -810,7 +810,7 @@ impl<I: VCodeInst> VCode<I> {
                         if self.insts[iix.index()].is_term() == MachTerminator::Ret {
                             for inst in self.abi.gen_epilogue() {
                                 let seq = classify(&inst)?;
-                                if seq.needs_internal() {
+                                if seq.needs_internal() && !I::ssbb_handles_emission() {
                                     return Err(CodegenError::Unsupported(format!(
                                         "aarch64_mitigation=ssbb: epilogue instruction has an internal store-to-load: {inst:?}"
                                     )));
@@ -856,7 +856,7 @@ impl<I: VCodeInst> VCode<I> {
                             }
                         };
                         let seq = classify(&inst)?;
-                        if seq.needs_internal() {
+                        if seq.needs_internal() && !I::ssbb_handles_emission() {
                             return Err(CodegenError::Unsupported(format!(
                                 "aarch64_mitigation=ssbb: spill/reload has an internal store-to-load: {inst:?}"
                             )));
@@ -911,7 +911,7 @@ impl<I: VCodeInst> VCode<I> {
             if block == entry {
                 barriers += SsbbSeq::count_barriers(true, &prologue_steps);
             }
-            extra_bytes[block] = barriers * 4;
+            extra_bytes[block] = barriers * I::ssbb_barrier_size();
         }
 
         Ok(SsbbPlan {
@@ -987,7 +987,7 @@ impl<I: VCodeInst> VCode<I> {
         let ssbb_on = I::ssbb_enabled(&self.emit_info);
         let ssbb_plan = if ssbb_on {
             let plan = self.compute_ssbb_plan(regalloc, flags)?;
-            buffer.set_veneer_load_barrier(Some(I::ssbb_barrier_word()));
+            buffer.set_veneer_load_barrier(I::ssbb_veneer_barrier());
             state.ssbb_install(&plan.block_in);
             Some(plan)
         } else {
@@ -1042,9 +1042,9 @@ impl<I: VCodeInst> VCode<I> {
                            disasm: &mut String,
                            buffer: &mut MachBuffer<I>,
                            state: &mut I::State| {
-                if ssbb_on {
+                if ssbb_on && !I::ssbb_handles_emission() {
                     let seq = inst
-                        .ssbb_seq(state.frame_layout(), flags)
+                        .ssbb_seq(state.frame_layout(), flags, &self.emit_info)
                         .expect("ssbb classification changed between the fixed-point and emission");
                     if !seq.needs_internal() {
                         let dirty = state.ssbb_dirty();
@@ -1315,8 +1315,8 @@ impl<I: VCodeInst> VCode<I> {
             }
 
             if let Some(plan) = ssbb_plan.as_ref() {
-                debug_assert_eq!(
-                    state.ssbb_barrier_count() * 4,
+                assert_eq!(
+                    state.ssbb_barrier_count() * I::ssbb_barrier_size(),
                     plan.extra_bytes[block.index()],
                     "ssbb insertion drifted from the fixed-point plan in block {}",
                     block.index()

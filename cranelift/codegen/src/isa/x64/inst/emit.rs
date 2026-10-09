@@ -176,6 +176,20 @@ pub(crate) fn emit(
         );
     }
 
+    // Run before any instruction offsets, relocations, or stack maps are
+    // captured. Multi-access expansions place barriers at their inner emits.
+    let was_suppressed = state.ssbb_suppressed;
+    if state.ssbb_active() && !was_suppressed {
+        let seq = super::ssbb::classify(inst, state.frame_layout(), info)
+            .expect("LFENCE classification changed between planning and emission");
+        if !seq.needs_internal() {
+            for step in seq.steps {
+                state.ssbb_step(step, sink, info);
+            }
+            state.ssbb_suppressed = true;
+        }
+    }
+
     match inst {
         Inst::CheckedSRemSeq { divisor, .. } | Inst::CheckedSRemSeq8 { divisor, .. } => {
             // Validate that the register constraints of the dividend and the
@@ -468,6 +482,7 @@ pub(crate) fn emit(
 
         Inst::ReturnCallKnown { info: call_info } => {
             emit_return_call_common_sequence(sink, info, state, &call_info);
+            state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Call, sink, info);
 
             // Finally, jump to the callee!
             //
@@ -486,6 +501,7 @@ pub(crate) fn emit(
             let callee = call_info.dest;
 
             emit_return_call_common_sequence(sink, info, state, &call_info);
+            state.ssbb_step(crate::machinst::ssbb::SsbbMemStep::Call, sink, info);
 
             asm::inst::jmpq_m::new(callee).emit(sink, info, state);
             sink.add_call_site();
@@ -1466,6 +1482,9 @@ pub(crate) fn emit(
 
             // again:
             sink.bind_label(again_label, state.ctrl_plane_mut());
+            // The retry edge follows a possibly writing CAS. Import that
+            // predecessor state so every iteration guards the next CAS.
+            state.ssbb_set_dirty(true);
 
             // movq %rax, %r_temp
             asm::inst::movq_mr::new(temp, dst_old.to_reg()).emit(sink, info, state);
@@ -1574,6 +1593,9 @@ pub(crate) fn emit(
 
             // again:
             sink.bind_label(again_label, state.ctrl_plane_mut());
+            // The retry edge follows a possibly writing CAS. Import that
+            // predecessor state so every iteration guards the next CAS.
+            state.ssbb_set_dirty(true);
 
             // Move old value to temp registers.
             asm::inst::movq_mr::new(temp_low, dst_old_low.to_reg()).emit(sink, info, state);
@@ -1689,6 +1711,9 @@ pub(crate) fn emit(
 
             // again:
             sink.bind_label(again_label, state.ctrl_plane_mut());
+            // The retry edge follows a possibly writing CAS. Import that
+            // predecessor state so every iteration guards the next CAS.
+            state.ssbb_set_dirty(true);
 
             // cmpxchg16b (mem)
             asm::inst::lock_cmpxchg16b_m::new(
@@ -1845,6 +1870,7 @@ pub(crate) fn emit(
         }
     }
 
+    state.ssbb_suppressed = was_suppressed;
     state.clear_post_insn();
 }
 
@@ -1865,47 +1891,48 @@ fn emit_return_call_common_sequence<T>(
     state: &mut EmitState,
     call_info: &ReturnCallInfo<T>,
 ) {
-    assert!(
-        info.flags.preserve_frame_pointers(),
-        "frame pointers aren't fundamentally required for tail calls, \
-                 but the current implementation relies on them being present"
-    );
-
-    let tmp = call_info.tmp.to_writable_reg();
-
-    for inst in
-        X64ABIMachineSpec::gen_clobber_restore(CallConv::Tail, &info.flags, state.frame_layout())
-    {
+    for inst in return_call_setup_insts(call_info, state.frame_layout(), info) {
         inst.emit(sink, info, state);
     }
+}
 
-    for inst in X64ABIMachineSpec::gen_epilogue_frame_restore(
+// Shared with classification: tail-call frame restoration and argument
+// resizing can contain internal load/store sequences.
+pub(super) fn return_call_setup_insts<T>(
+    call_info: &ReturnCallInfo<T>,
+    frame: &FrameLayout,
+    info: &EmitInfo,
+) -> SmallVec<[Inst; 16]> {
+    assert!(
+        info.flags.preserve_frame_pointers(),
+        "the current tail-call implementation requires frame pointers"
+    );
+    let mut insts = X64ABIMachineSpec::gen_clobber_restore(CallConv::Tail, &info.flags, frame);
+    insts.extend(X64ABIMachineSpec::gen_epilogue_frame_restore(
         CallConv::Tail,
         &info.flags,
         &info.isa_flags,
-        state.frame_layout(),
-    ) {
-        inst.emit(sink, info, state);
-    }
-
-    let incoming_args_diff = state.frame_layout().tail_args_size - call_info.new_stack_arg_size;
+        frame,
+    ));
+    let incoming_args_diff = frame.tail_args_size - call_info.new_stack_arg_size;
     if incoming_args_diff > 0 {
-        // Move the saved return address up by `incoming_args_diff`.
-        let addr = Amode::imm_reg(0, regs::rsp());
-        asm::inst::movq_rm::new(tmp, addr).emit(sink, info, state);
-        asm::inst::movq_mr::new(
-            Amode::imm_reg(i32::try_from(incoming_args_diff).unwrap(), regs::rsp()),
-            Gpr::unwrap_new(tmp.to_reg()),
-        )
-        .emit(sink, info, state);
-
-        // Increment the stack pointer to shrink the argument area for the new
-        // call.
-        let rsp = Writable::from_reg(regs::rsp());
-        let incoming_args_diff = i32::try_from(incoming_args_diff)
-            .expect("`incoming_args_diff` is too large to fit in a 32-bit signed immediate");
-        Inst::addq_mi(rsp, incoming_args_diff).emit(sink, info, state);
+        let tmp = call_info.tmp.to_writable_reg();
+        insts.push(Inst::External {
+            inst: asm::inst::movq_rm::new(tmp, Amode::imm_reg(0, regs::rsp())).into(),
+        });
+        insts.push(Inst::External {
+            inst: asm::inst::movq_mr::new(
+                Amode::imm_reg(i32::try_from(incoming_args_diff).unwrap(), regs::rsp()),
+                Gpr::unwrap_new(tmp.to_reg()),
+            )
+            .into(),
+        });
+        insts.push(Inst::addq_mi(
+            Writable::from_reg(regs::rsp()),
+            i32::try_from(incoming_args_diff).unwrap(),
+        ));
     }
+    insts
 }
 
 /// Conveniene trait to have an `emit` method on all `asm::inst::*` variants.

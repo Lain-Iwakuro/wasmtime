@@ -3759,12 +3759,13 @@ impl MachInstEmit for Inst {
         &self,
         frame: &FrameLayout,
         flags: &settings::Flags,
+        _info: &EmitInfo,
     ) -> crate::CodegenResult<crate::machinst::ssbb::SsbbSeq> {
         super::ssbb::classify(self, frame, flags)
     }
 
-    fn ssbb_barrier_word() -> u32 {
-        super::ssbb::SSBB_ENCODING
+    fn ssbb_veneer_barrier() -> Option<u32> {
+        Some(super::ssbb::SSBB_ENCODING)
     }
 
     fn ssbb_mnemonic() -> &'static str {
