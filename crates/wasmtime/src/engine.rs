@@ -528,6 +528,18 @@ information about this check\
         flag: &str,
         value: &FlagValue,
     ) -> Result<(), String> {
+        // This experiment changes instrumentation, not the Wasm execution ABI.
+        // The launcher validates dispatch-serializing LFENCE on the running CPU.
+        // Validate before the generic Boolean/pointer-width cases below.
+        if flag == "x64_mitigation" {
+            return match value {
+                FlagValue::Enum("none" | "lfence") => Ok(()),
+                _ => Err(format!(
+                    "isa-specific feature {flag:?} configured to unknown value {value:?}"
+                )),
+            };
+        }
+
         match value {
             // ISA flags are used for things like CPU features, so if they're
             // disabled then it's compatible with the native host.
@@ -1020,5 +1032,69 @@ impl EngineWeak {
     /// strong references (the [`Engine`] type itself) no longer exist.
     pub fn upgrade(&self) -> Option<Engine> {
         alloc::sync::Weak::upgrade(&self.inner).map(|inner| Engine { inner })
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "cranelift",
+    feature = "runtime",
+    target_arch = "x86_64"
+))]
+mod x64_mitigation_tests {
+    use super::*;
+    use crate::Module;
+
+    #[test]
+    fn x64_mitigation_compiles_and_deserializes_on_native_host() -> Result<()> {
+        // Binary encoding of an empty module: exercise the native-host gate
+        // without depending on the optional WAT parser or executing guest code.
+        let wasm = b"\0asm\x01\0\0\0";
+        for mode in [None, Some("none"), Some("lfence")] {
+            let mut config = Config::new();
+            if let Some(mode) = mode {
+                // SAFETY: these experiment modes preserve the Wasm execution ABI.
+                unsafe {
+                    config.cranelift_flag_set("x64_mitigation", mode);
+                }
+            }
+            let engine = Engine::new(&config)?;
+            let module = Module::new(&engine, wasm)?;
+            let serialized = module.serialize()?;
+            // SAFETY: this blob was just produced by this engine and is unmodified.
+            let _module = unsafe { Module::deserialize(&engine, &serialized)? };
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn x64_mitigation_compatibility_accepts_only_its_two_enum_values() {
+        let engine = Engine::default();
+        for mode in ["none", "lfence"] {
+            assert!(
+                engine
+                    .check_compatible_with_isa_flag("x64_mitigation", &FlagValue::Enum(mode))
+                    .is_ok()
+            );
+        }
+        for value in [
+            FlagValue::Enum("ssbb"),
+            FlagValue::Enum("cas_csdb"),
+            FlagValue::Enum("unknown"),
+            FlagValue::Enum("pointer64"),
+            FlagValue::Bool(false),
+        ] {
+            assert!(
+                engine
+                    .check_compatible_with_isa_flag("x64_mitigation", &value)
+                    .is_err(),
+                "unexpectedly accepted {value:?}"
+            );
+        }
+        assert!(
+            engine
+                .check_compatible_with_isa_flag("unknown_mitigation", &FlagValue::Enum("none"))
+                .is_err()
+        );
     }
 }
