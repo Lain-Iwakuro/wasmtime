@@ -1,0 +1,7 @@
+{
+  "compiler_commit": "2648e4a22107d3409c2e0cfac9499c3772dc25a7",
+  "compiler_base": "1cea7556c072bc9304a4770afc88de9e0b956ccb",
+  "repository": "https://github.com/Lain-Iwakuro/wasmtime.git",
+  "handoff_branch": "experiment/v4-selective-fences",
+  "v4_rule_version": 1
+}

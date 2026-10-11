@@ -1,0 +1,6 @@
+{
+  "00-pthread-malloc-free.wasm": "d14f3e10fca626860da7703abae863d3023836a6a04c01ce38906c371b3007b3",
+  "01-malloc-multithreading.wasm": "6fcffb5c98dc89703b599856ab56362f3fee7ce1f436b926211526d2cb67e5f5",
+  "02-fluidanimate.wasm": "fc94c58be6916eada4f6573bbe6317a8398476d01b922768ff435cb796b7bcb0",
+  "03-in_35K.fluid": "0a649e52c616ee52ef24038b1d4dae316520f517c122f45fa16755b761ada5a6"
+}
